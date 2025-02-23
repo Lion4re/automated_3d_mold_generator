@@ -64,7 +64,7 @@ This makes it ideal for projects and rapid prototyping in academic or industrial
 1. **Clone the Repository:**
 
    ```bash
-   git clone 
+   git clone https://github.com/Lion4re/automated_3d_mold_generator
    cd mold-generator
    ```
 
@@ -138,4 +138,3 @@ Vasileios Papageridis, "Automated 3D Mold Generation Tool", GitHub repository, h
 ## Acknowledgments
 
 This project was developed as part of a research initiative supported by Institute of Computer Science - Foundation for Research and Technology Hellas (FORTH). Special thanks to the developers of trimesh, Open3D, and ipywidgets for providing the essential libraries used in this project.
-```
