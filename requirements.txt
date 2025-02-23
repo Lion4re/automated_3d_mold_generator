@@ -1,0 +1,5 @@
+trimesh
+numpy
+open3d
+tqdm
+ipywidgets
