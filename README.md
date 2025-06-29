@@ -49,7 +49,7 @@ pip install pyglet
 
 1. **Download the STL Mold Maker**
    ```bash
-   git clone https://github.com/your-repo/STL_Mold_Maker.git
+   git clone https://github.com/Lion4re/automated_3d_mold_generator
    cd STL_Mold_Maker
    ```
 
