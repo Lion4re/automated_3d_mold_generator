@@ -3,3 +3,6 @@ numpy
 open3d
 tqdm
 ipywidgets
+scipy
+opencv-python
+pyglet
