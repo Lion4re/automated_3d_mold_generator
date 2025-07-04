@@ -2,7 +2,15 @@
 
 Create professional negative space molds from STL files with intelligent wall thickness detection, alignment keys, and pour spouts. Perfect for casting resin, wax, chocolate, soap, and other materials.
 
-## 🚀 Features
+## 🌐 Project Affiliation
+
+This work is part of the **CRAEFT Project** ([craeft.eu](https://craeft.eu)) - **"Craft Understanding, Education, Training, and Preservation for Posterity and Prosperity"** - a European Union Horizon Europe research initiative (Grant Agreement No 101094349) that deepens our understanding of traditional making activities including "care, judgement, and dexterity."
+
+**Foundation for Research and Technology Hellas (FORTH)** coordinates the CRAEFT project, which employs advanced digitization, haptic immersivity, and computational intelligence to preserve and transmit craft knowledge as living heritage. CRAEFT focuses on eight representative traditional crafts across Europe (glass, porcelain, clay, marble, wood, silver, wool tapestry, and textiles) with the goal of digital conservation, craft education, and scaling traditional techniques.
+
+This automated 3D mold generator contributes to CRAEFT's mission by providing digital fabrication tools that support craft education and training, enabling the preservation and accessibility of traditional making techniques while bridging the gap between heritage crafts and modern manufacturing capabilities. The tool's intelligent approach to mold creation aligns with CRAEFT's objectives of connecting tacit knowledge with computer-aided design tools and supporting experimental approaches to traditional craft workflows.
+
+## �� Features
 
 ### Core Functionality
 - **Intelligent Wall Thickness**: Automatically calculates optimal wall thickness based on object size, geometry, and manufacturing constraints
