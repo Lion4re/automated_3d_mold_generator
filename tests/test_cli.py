@@ -264,7 +264,7 @@ def test_make_writes_files_and_prints_summary(generated):
     }
     for text in ("2-piece mold", "top", "bottom", "Wall thickness", "Warning: Example warning"):
         assert text in result.stdout
-    assert "Saved 4 files to molds/part" in result.stdout
+    assert f"Saved 4 files to {Path('molds/part')}" in result.stdout
 
 
 def test_batch_continues_after_a_failure(generated):
@@ -297,7 +297,7 @@ def test_json_output_for_one_model(generated):
     assert data["model"] == "part.stl"
     assert data["mold"]["pieces"] == 2
     assert data["warnings"] == ["Example warning"]
-    assert Path(data["output_dir"], "report.json").as_posix() in data["files"]
+    assert str(Path(data["output_dir"], "report.json")) in data["files"]
 
 
 def test_json_output_for_a_batch_includes_failures(generated):
@@ -316,7 +316,7 @@ def test_refuses_to_overwrite_without_force(generated):
     _touch(Path("molds/part/notes.txt"))
     result = invoke("make", "part.stl")
     assert result.exit_code == 1
-    assert "molds/part already contains files" in result.stderr
+    assert f"{Path('molds/part')} already contains files" in result.stderr
     assert "--force" in result.stderr
     assert not generated
 

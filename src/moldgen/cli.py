@@ -641,7 +641,7 @@ def _analysis(
             f"the cast may lock in a rigid mold. {advice}"
         )
 
-    command = ["moldgen", "make", str(model)]
+    command = ["moldgen", "make", Path(model).as_posix()]
     if config.material != _DEFAULTS.material:
         command += ["--material", config.material]
     if config.print_material != _DEFAULTS.print_material:
@@ -826,7 +826,15 @@ def _guided(ui: Ui) -> int:
         if not force:
             console.print("Nothing was generated.")
             return 1
-    command = ["moldgen", "make", str(model), "--material", material, "--pieces", str(pieces)]
+    command = [
+        "moldgen",
+        "make",
+        Path(model).as_posix(),
+        "--material",
+        material,
+        "--pieces",
+        str(pieces),
+    ]
     if force:
         command.append("--force")
     console.print(Text(f"Equivalent command: {shlex.join(command)}"), soft_wrap=True)
