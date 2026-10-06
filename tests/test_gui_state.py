@@ -1,0 +1,102 @@
+import numpy as np
+import pytest
+import trimesh
+
+from moldgen.config import ConfigError, MoldConfig
+from moldgen.gui import state as st
+from moldgen.parting import FACE_LOW_DRAFT, FACE_OK, FACE_UNDERCUT, analyze_parting
+
+
+def test_default_settings_map_back_to_the_default_config():
+    config = st.to_config(st.MoldSettings.from_config())
+    assert config.to_dict() == MoldConfig().to_dict()
+
+
+def test_manual_values_override_the_automatic_ones(sphere):
+    settings = st.MoldSettings.from_config()
+    settings.wall_auto = False
+    settings.wall_thickness = 7.5
+    settings.sprue_auto = False
+    settings.sprue_diameter = 4.0
+    settings.shrinkage_override = True
+    settings.shrinkage_percent = 1.5
+    settings.pieces = 4
+    parting = analyze_parting(sphere, np.array([0.0, 0.0, 1.0]), 2.0)
+
+    config = st.to_config(settings, parting)
+
+    assert config.wall_thickness == 7.5
+    assert config.sprue_diameter == 4.0
+    assert config.shrinkage == pytest.approx(0.015)
+    assert config.pieces == 4
+    assert config.direction == (0.0, 0.0, 1.0)
+    assert config.parting_offset == pytest.approx(2.0)
+
+
+def test_invalid_settings_raise_config_error():
+    settings = st.MoldSettings.from_config()
+    settings.shrinkage_override = True
+    settings.shrinkage_percent = 25.0
+    with pytest.raises(ConfigError):
+        st.to_config(settings)
+
+
+def test_direction_choices_list_auto_then_candidates_then_axes(spool):
+    analysis = analyze_parting(spool)
+    choices = st.direction_choices(analysis)
+    labels = [c.label for c in choices]
+
+    assert labels[0] == st.AUTO_DIRECTION
+    assert labels[-3:] == list(st.AXIS_DIRECTIONS)
+    assert len(choices) == 1 + len(analysis.candidates) + 3
+    assert choices[0].offset == analysis.offset
+    assert all(c.offset is None for c in choices[-3:])
+    assert st.direction_label([0.0, 0.0, -1.0]) == "-Z"
+
+
+def test_surface_fractions_are_area_weighted():
+    areas = np.array([1.0, 2.0, 3.0, 4.0])
+    classes = np.array([FACE_OK, FACE_LOW_DRAFT, FACE_UNDERCUT, FACE_UNDERCUT])
+    assert st.surface_fractions(areas, classes) == pytest.approx((0.7, 0.2))
+
+
+@pytest.mark.parametrize(("lo", "hi"), [(-16.23, 16.21), (0.0, 1234.5), (3.0, 3.004)])
+def test_slider_range_covers_the_span_with_a_round_step(lo, hi):
+    low, high, step = st.slider_range(lo, hi)
+    assert low <= lo and high >= hi
+    mantissa = step / 10 ** np.floor(np.log10(step))
+    assert round(mantissa, 6) in (1.0, 2.0, 5.0)
+    assert round(step, st.step_precision(step)) == step
+
+
+def test_plane_frame_lies_on_the_plane_and_faces_the_direction(rng):
+    vertices = rng.normal(size=(200, 3)) * 10
+    direction = np.array([1.0, 2.0, 2.0]) / 3.0
+    frame = st.plane_frame(vertices, direction, 4.0)
+
+    assert np.dot(frame.position, direction) == pytest.approx(4.0)
+    rotation = trimesh.transformations.quaternion_matrix(frame.wxyz)[:3, :3]
+    assert rotation @ [0.0, 0.0, 1.0] == pytest.approx(direction)
+
+
+def test_shading_split_keeps_face_order_and_geometry(cylinder):
+    vertices, faces = st.shading_split(cylinder)
+    assert len(faces) == len(cylinder.faces)
+    assert np.allclose(vertices[faces], cylinder.triangles, atol=1e-4)
+    # The sharp rims are split, so there are more vertices than in the input.
+    assert len(vertices) > len(cylinder.vertices)
+
+
+def test_halves_explode_along_the_parting_direction():
+    block = np.array([[-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]])
+    top = np.array([[-10.0, -10.0, 0.0], [10.0, 10.0, 10.0]])
+    bottom = np.array([[-10.0, -10.0, -10.0], [10.0, 10.0, 0.0]])
+    dirs = st.explode_directions([top, bottom], block)
+    assert dirs == pytest.approx(np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]))
+
+
+def test_text_is_escaped_and_incompatible_materials_are_flagged():
+    assert "<b>" not in st.info_html([("Name", "<b>x</b>")])
+    assert "softens" in st.material_html("pewter", "pla")
+    assert "softens" not in st.material_html("resin", "pla")
+    assert st.download_name("../my part!") == "my_part_mold.zip"

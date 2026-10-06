@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moldgen"
+version = "1.0.0.dev0"
+description = "Generate 3D-printable casting molds from 3D models: automatic parting, undercut analysis, sprue, vents and registration keys."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Vasilis Papageridis" }]
+requires-python = ">=3.10"
+keywords = ["mold", "casting", "3d-printing", "stl", "mesh", "manufacturing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Manufacturing",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "trimesh>=4.4",
+    "manifold3d>=3.0",
+    "shapely>=2.0",
+    "lxml>=4.9",
+    "rtree>=1.0",
+    "typer>=0.12",
+    "rich>=13.0",
+    "viser>=1.0",
+]
+
+[project.optional-dependencies]
+repair = ["pymeshfix>=0.17"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+moldgen = "moldgen.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Lion4re/automated_3d_mold_generator"
+Issues = "https://github.com/Lion4re/automated_3d_mold_generator/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moldgen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: runs the full pipeline on the bundled sample models"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
