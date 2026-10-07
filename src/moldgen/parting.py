@@ -283,6 +283,38 @@ def analyze_parting(
     )
 
 
+def releasable(
+    mesh: trimesh.Trimesh,
+    direction: np.ndarray,
+    *,
+    faces: np.ndarray | None = None,
+    release_tolerance: float = RELEASE_TOLERANCE_MM,
+) -> np.ndarray:
+    """Per-face flags: whether mold material on the face slides off along ``direction``.
+
+    Uses the occlusion-aware release test described in the module docstring.
+    With a boolean ``faces`` mask, rays are cast only for those faces; the
+    others are judged by their normal alone, which can only err towards
+    "released".
+    """
+    up, _ = _release(
+        mesh,
+        _unit(direction),
+        True,
+        release_tolerance,
+        test_up=faces,
+        test_down=np.zeros(len(mesh.faces), dtype=bool),
+    )
+    return up
+
+
+def release_tolerance_for(
+    mesh: trimesh.Trimesh, release_tolerance: float = RELEASE_TOLERANCE_MM
+) -> float:
+    """The release tolerance in effect for ``mesh`` (mm), capped for very small parts."""
+    return _tolerance(mesh, release_tolerance)
+
+
 def _unit(vector: np.ndarray) -> np.ndarray:
     v = np.asarray(vector, dtype=float).reshape(3)
     norm = np.linalg.norm(v)
@@ -399,7 +431,30 @@ def _blocked(tris: np.ndarray, planes: np.ndarray, points: np.ndarray) -> np.nda
     Both arrays are in a frame whose Z axis is the ray direction; ``tris`` is
     (T, 3, 3), ``planes`` its :func:`_barycentric_planes` and ``points`` is (Q, 3).
     """
-    hit = np.zeros(len(points), dtype=bool)
+    return np.isfinite(_first_hit(tris, planes, points))
+
+
+def ray_hit_distances(
+    mesh: trimesh.Trimesh, origins: np.ndarray, direction: np.ndarray
+) -> np.ndarray:
+    """Distance from each origin along ``direction`` to the first face it enters (inf if none).
+
+    The origins must lie outside the closed ``mesh``, so the first face a ray
+    meets faces against it; only those faces are tested.
+    """
+    direction = _unit(direction)
+    frame = _ray_frame(direction)
+    facing = mesh.face_normals @ direction < -FACING_EPS
+    tris = mesh.triangles[facing] @ frame.T
+    return _first_hit(tris, _barycentric_planes(tris), np.asarray(origins) @ frame.T)
+
+
+def _first_hit(tris: np.ndarray, planes: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """For rays from ``points`` along local +Z, the distance to the nearest triangle hit.
+
+    Same frame and arguments as :func:`_blocked`; inf where nothing is hit.
+    """
+    hit = np.full(len(points), np.inf)
     if len(tris) == 0 or len(points) == 0:
         return hit
 
@@ -450,7 +505,9 @@ def _blocked(tris: np.ndarray, planes: np.ndarray, points: np.ndarray) -> np.nda
         q = q[inside]
         p = points[q]
         h = pair_planes[inside, 2]
-        hit[q[h[:, 0] * p[:, 0] + h[:, 1] * p[:, 1] + h[:, 2] > p[:, 2]]] = True
+        gap = h[:, 0] * p[:, 0] + h[:, 1] * p[:, 1] + h[:, 2] - p[:, 2]
+        ahead = gap > 0
+        np.minimum.at(hit, q[ahead], gap[ahead])
     return hit
 
 

@@ -18,7 +18,7 @@ import trimesh
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
-from moldgen.config import MoldConfig
+from moldgen.config import MAX_AUTO_PIECES, MIN_AUTO_PIECES, MoldConfig
 from moldgen.materials import MATERIALS, PRINT_MATERIALS, compatibility_warnings
 from moldgen.meshio import SUPPORTED_SUFFIXES
 from moldgen.parting import FACE_LOW_DRAFT, FACE_OK, FACE_UNDERCUT
@@ -41,13 +41,23 @@ FACE_LABELS: dict[int, str] = {
 }
 FACE_KEYS: dict[int, str] = {FACE_OK: "ok", FACE_LOW_DRAFT: "low_draft", FACE_UNDERCUT: "undercut"}
 
-# Muted, cool tones so the amber and red analysis colours stay distinct inside the mold.
+# Muted tones, one per piece (up to MAX_AUTO_PIECES), kept clear of the amber and red
+# analysis colours so those still stand out on the part and inside the mold.
 PIECE_COLORS: tuple[RGB, ...] = (
     (116, 141, 173),
     (139, 163, 126),
     (152, 139, 176),
     (108, 154, 152),
+    (106, 106, 88),
+    (136, 88, 124),
+    (70, 118, 82),
+    (118, 196, 172),
+    (70, 106, 118),
+    (70, 100, 148),
 )
+FILLED_COLOR: RGB = FACE_COLORS[FACE_UNDERCUT]
+FILLED = -1
+"""Face label for areas no piece can release, where the cavity was filled."""
 PLANE_COLOR: RGB = (56, 110, 182)
 
 AUTO_DIRECTION = "Auto (best)"
@@ -62,7 +72,9 @@ UNIT_LABELS: dict[str, str] = {
     "m": "Metres",
     "in": "Inches",
 }
-PIECE_OPTIONS: dict[str, int] = {"2 pieces": 2, "4 pieces": 4}
+AUTO_PIECES = "Automatic"
+PIECE_OPTIONS: dict[str, int | str] = {AUTO_PIECES: "auto", "2 pieces": 2, "4 pieces": 4}
+MAX_PIECES_RANGE = (MIN_AUTO_PIECES, MAX_AUTO_PIECES)
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +94,8 @@ class MoldSettings:
     repair: bool = True
     material: str = "resin"
     print_material: str = "pla"
-    pieces: int = 2
+    pieces: int | str = "auto"
+    max_pieces: int = 6
     wall_auto: bool = True
     wall_thickness: float = 10.0
     keys: int = 4
@@ -112,6 +125,7 @@ class MoldSettings:
             material=material.key,
             print_material=print_material,
             pieces=config.pieces,
+            max_pieces=config.max_pieces,
             wall_auto=config.wall_thickness is None,
             wall_thickness=config.wall_thickness or material.min_wall_mm,
             keys=config.keys,
@@ -144,7 +158,8 @@ def to_config(settings: MoldSettings, parting: PartingResult | None = None) -> M
         scale=float(settings.scale),
         direction=direction,
         parting_offset=offset,
-        pieces=int(settings.pieces),
+        pieces=settings.pieces if settings.pieces == "auto" else int(settings.pieces),
+        max_pieces=int(settings.max_pieces),
         wall_thickness=None if settings.wall_auto else float(settings.wall_thickness),
         shrinkage=float(settings.shrinkage_percent) / 100.0
         if settings.shrinkage_override
@@ -416,6 +431,40 @@ def explode_directions(piece_bounds: Sequence[np.ndarray], block_bounds: np.ndar
     return out
 
 
+def piece_color(index: int) -> RGB:
+    """Colour of the piece at ``index`` in removal order."""
+    return PIECE_COLORS[index % len(PIECE_COLORS)]
+
+
+def face_pieces(
+    face_region: np.ndarray, side_pieces: int, top_needed: bool, piece_names: Sequence[str]
+) -> np.ndarray:
+    """Map :attr:`PieceLayout.face_region` to indices into ``piece_names`` (or ``FILLED``).
+
+    Regions are numbered side pieces first, then top, then bottom; when the
+    top is not needed its region belongs to the bottom piece.
+    """
+    regions = [f"side_{k + 1}" for k in range(side_pieces)]
+    regions += ["top" if top_needed else "bottom", "bottom"]
+    names = list(piece_names)
+    # The trailing FILLED entry is what region -1 indexes. A piece that came out
+    # empty releases nothing, so its region cannot hold faces in practice.
+    lookup = [names.index(name) if name in names else FILLED for name in regions] + [FILLED]
+    return np.asarray(lookup, dtype=np.int64)[np.asarray(face_region, dtype=np.int64)]
+
+
+def legend_rows(info: Mapping[str, Any]) -> list[tuple[str, str, RGB]]:
+    """(name, pull direction, colour) per piece of :func:`moldgen.report.summary`.
+
+    A "filled" row with the share of the surface follows when locked areas were filled.
+    """
+    rows = [(p["name"], p["pull_label"], piece_color(i)) for i, p in enumerate(info["pieces"])]
+    layout = info.get("layout")
+    if layout and layout["locked_fraction"] > 0:
+        rows.append(("filled", _percent(layout["locked_fraction"]), FILLED_COLOR))
+    return rows
+
+
 def scene_floor(min_z: Sequence[float], offsets: np.ndarray | None = None) -> float:
     """Lowest point of the displayed geometry, given each object's lowest z and displacement."""
     z = np.asarray(min_z, dtype=float)
@@ -588,19 +637,28 @@ def readout_html(undercut: float | None, low_draft: float | None) -> str:
             FACE_LOW_DRAFT: _percent(low_draft),
             FACE_UNDERCUT: _percent(undercut),
         }
-    rows = []
-    for cls in (FACE_OK, FACE_LOW_DRAFT, FACE_UNDERCUT):
-        r, g, b = FACE_COLORS[cls]
-        rows.append(
+    return swatch_html(
+        [
+            (FACE_LABELS[c], values[c], FACE_COLORS[c])
+            for c in (FACE_OK, FACE_LOW_DRAFT, FACE_UNDERCUT)
+        ]
+    )
+
+
+def swatch_html(rows: Sequence[tuple[str, str, RGB]]) -> str:
+    """Colour legend: a swatch, a label and a right-aligned value per row."""
+    cells = []
+    for label, value, (r, g, b) in rows:
+        cells.append(
             f'<span style="width:0.75em;height:0.75em;border-radius:2px;'
             f'background:rgb({r},{g},{b})"></span>'
-            f"<span>{FACE_LABELS[cls]}</span>"
-            f'<span style="text-align:right;{NUMERIC}">{values[cls]}</span>'
+            f"<span>{_esc(label)}</span>"
+            f'<span style="text-align:right;{NUMERIC}">{_esc(value)}</span>'
         )
     return (
         '<div style="display:grid;grid-template-columns:auto 1fr auto;align-items:center;'
         'column-gap:0.5em;row-gap:0.3em;font-size:0.875em;padding:0.1em 0.75em 0.4em">'
-        + "".join(rows)
+        + "".join(cells)
         + "</div>"
     )
 
@@ -626,6 +684,17 @@ def summary_html(info: Mapping[str, Any]) -> str:
         ("Keys", f"{mold['keys']}, {mold['key_clearance_mm']:.2f} mm clearance"),
         ("Cast volume", f"{info['material']['cast_volume_cm3']:.2f} cm³"),
     ]
+    layout = info.get("layout")
+    if layout:
+        rows.append(("Removal order", ", ".join(p["name"] for p in info["pieces"])))
+        if layout["locked_fraction"] > 0:
+            rows.append(
+                (
+                    "Filled",
+                    f"{_percent(layout['locked_fraction'])} of the surface, "
+                    f"{layout['filled_volume_cm3']:.2f} cm³ added to the cast",
+                )
+            )
     table = [
         '<div style="display:grid;grid-template-columns:1fr auto auto;column-gap:0.75em;'
         f'row-gap:0.15em;margin-top:0.6em;{NUMERIC}">',

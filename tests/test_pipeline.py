@@ -52,9 +52,17 @@ def test_spool_is_split_through_its_axle(spool):
 
 
 def test_forced_direction_reports_undercut(spool):
-    result = generate_mold(spool, MoldConfig(direction="z"))
+    result = generate_mold(spool, MoldConfig(direction="z", pieces=2))
     assert result.parting.undercut_fraction > 0.05
     assert any("undercut" in warning for warning in result.warnings)
+
+
+def test_side_pieces_release_a_forced_direction(spool):
+    result = generate_mold(spool, MoldConfig(direction="z"))
+    assert result.parting.undercut_fraction > 0.05
+    assert result.layout.caps
+    assert result.layout.locked_fraction < 0.005
+    assert not any("catch" in warning for warning in result.warnings)
 
 
 def test_cavity_is_open_to_the_outside(sphere):

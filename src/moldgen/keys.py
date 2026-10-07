@@ -1,8 +1,9 @@
 """Registration keys that align mold pieces.
 
 Each key is a male bump on one piece and a matching socket, enlarged by the
-clearance, on the mating piece. Keys sit on an axis-aligned mating face in the
-mold frame and are kept clear of the cavity and of any gating channels.
+clearance, on the mating piece. Keys sit on a flat mating face (axis-aligned
+for the halves, any orientation for side pieces) and are kept clear of the
+cavity, the gating channels and other seams.
 
 Key shape
 ---------
@@ -159,15 +160,75 @@ def plan_keys(
         return plan
 
     in_plane = [(axis + 1) % 3, (axis + 2) % 3]
-    plane = float(face_bounds[0, axis])
     reach = plan.footprint_radius + margin
     low = face_bounds.min(axis=0)[in_plane] + reach
     high = face_bounds.max(axis=0)[in_plane] - reach
     allowed = shapely.box(*low, *high) if np.all(low < high) else shapely.Polygon()
+    # Cyclic axis permutation (no mirroring) that moves the face normal onto Z.
+    rows = np.eye(3)[[(axis + 1) % 3, (axis + 2) % 3, axis]]
+    _place(plan, obstacles, rows, float(face_bounds[0, axis]), allowed, count, margin)
+    return plan
 
+
+def plan_keys_on_plane(
+    obstacles: list[trimesh.Trimesh],
+    normal: np.ndarray,
+    offset: float,
+    region: shapely.Geometry,
+    *,
+    count: int,
+    radius: float,
+    clearance: float,
+    margin: float,
+) -> KeyPlan:
+    """Place up to ``count`` keys on the plane ``dot(p, normal) == offset``.
+
+    ``region`` is the mating face in the coordinates of :func:`plane_basis`
+    (``u = dot(p, rows[0])``, ``v = dot(p, rows[1])``). Male keys protrude
+    along ``normal``, as for :func:`plan_keys`; ``normal`` may point anywhere.
+    """
+    rows = plane_basis(normal)
+    if count < 0 or radius <= 0 or clearance < 0 or margin < 0:
+        raise ValueError("count, clearance and margin must be non-negative and radius positive")
+    plan = KeyPlan(
+        normal=rows[2], positions=np.empty((0, 3)), radius=float(radius), clearance=float(clearance)
+    )
+    plan._check_size()
+    if count == 0:
+        return plan
+    allowed = region.buffer(-(plan.footprint_radius + margin))
+    _place(plan, obstacles, rows, float(offset), allowed, count, margin)
+    return plan
+
+
+def plane_basis(normal: np.ndarray) -> np.ndarray:
+    """Right-handed rows ``(e1, e2, n)``: two in-plane unit vectors, then the unit normal."""
+    n = np.asarray(normal, dtype=float).reshape(3)
+    n = n / np.linalg.norm(n)
+    helper = np.eye(3)[np.argmin(np.abs(n))]
+    e1 = np.cross(helper, n)
+    e1 /= np.linalg.norm(e1)
+    return np.stack([e1, np.cross(n, e1), n])
+
+
+def _place(
+    plan: KeyPlan,
+    obstacles: list[trimesh.Trimesh],
+    rows: np.ndarray,
+    plane: float,
+    allowed: shapely.Geometry,
+    count: int,
+    margin: float,
+) -> None:
+    """Fill ``plan.positions`` with up to ``count`` keys in ``allowed``, clear of ``obstacles``.
+
+    ``rows`` maps mold coordinates to face coordinates whose third axis is
+    the face normal; the face lies at ``plane`` along that axis.
+    """
+    reach = plan.footprint_radius + margin
     if obstacles and not allowed.is_empty:
         shadows = [
-            _shadow(obstacle, axis, plane, plan.socket_depth + margin) for obstacle in obstacles
+            _shadow(obstacle, rows, plane, plan.socket_depth + margin) for obstacle in obstacles
         ]
         # Grow the buffer so its polygonal arcs stay outside the true round offset.
         grow = reach / np.cos(np.pi / (4 * BUFFER_QUAD_SEGMENTS))
@@ -176,21 +237,18 @@ def plan_keys(
 
     spacing = max(KEY_SPACING_RADII * plan.radius, 2.0 * plan.footprint_radius + margin)
     points = _spread_points(allowed, count, spacing)
-    positions = np.full((len(points), 3), plane)
-    positions[:, in_plane] = points
-    plan.positions = positions
-    if len(positions) < count:
+    plan.positions = points @ rows[:2] + plane * rows[2]
+    if len(plan.positions) < count:
         # The pipeline reports this to the user.
-        logger.info("Only %d of %d registration keys fit on the mating face", len(positions), count)
-    return plan
+        logger.info(
+            "Only %d of %d registration keys fit on the mating face", len(plan.positions), count
+        )
 
 
 def _shadow(
-    obstacle: trimesh.Trimesh, axis: int, plane: float, half_thickness: float
+    obstacle: trimesh.Trimesh, rows: np.ndarray, plane: float, half_thickness: float
 ) -> shapely.Geometry:
     """Projection onto the face of the part of ``obstacle`` within ``half_thickness`` of it."""
-    # Cyclic axis permutation (no mirroring) that moves the face normal onto Z.
-    rows = np.eye(3)[[(axis + 1) % 3, (axis + 2) % 3, axis]]
     solid = to_manifold(obstacle).transform(np.column_stack([rows, np.zeros(3)]))
     slab = solid.trim_by_plane((0.0, 0.0, 1.0), plane - half_thickness).trim_by_plane(
         (0.0, 0.0, -1.0), -(plane + half_thickness)

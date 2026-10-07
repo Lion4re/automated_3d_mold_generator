@@ -25,6 +25,10 @@ AXIS_VECTORS: dict[str, tuple[float, float, float]] = {
 }
 
 
+MIN_AUTO_PIECES = 2
+MAX_AUTO_PIECES = 10
+
+
 class ConfigError(ValueError):
     """Raised when a configuration value is invalid."""
 
@@ -56,8 +60,12 @@ class MoldConfig:
     """Parting plane position along ``direction`` in the input frame (mm).
     ``None`` picks the position with the least undercut area."""
 
-    pieces: int = 2
-    """2 for a classic two-part mold, 4 to also split each half once more."""
+    pieces: int | str = "auto"
+    """2 for a classic two-part mold, 4 to also split each half once more, or
+    "auto" to add side pieces wherever the two halves cannot release the part."""
+
+    max_pieces: int = 6
+    """Most pieces "auto" may use; areas still locked are filled in the cavity."""
 
     wall_thickness: float | None = None
     """Minimum distance from the part's bounding box to the outside of the mold."""
@@ -123,8 +131,10 @@ class MoldConfig:
             raise ConfigError(f"Unknown units {self.units!r}; use mm, cm, m or in")
         if not self.scale > 0:
             raise ConfigError("Scale must be positive")
-        if self.pieces not in (2, 4):
-            raise ConfigError("Pieces must be 2 or 4")
+        if self.pieces not in (2, 4, "auto"):
+            raise ConfigError("Pieces must be 2, 4 or auto")
+        if not MIN_AUTO_PIECES <= self.max_pieces <= MAX_AUTO_PIECES:
+            raise ConfigError(f"Max pieces must be between {MIN_AUTO_PIECES} and {MAX_AUTO_PIECES}")
         if self.wall_thickness is not None and not self.wall_thickness > 0:
             raise ConfigError("Wall thickness must be positive")
         if self.shrinkage is not None and not -0.05 <= self.shrinkage < 0.2:

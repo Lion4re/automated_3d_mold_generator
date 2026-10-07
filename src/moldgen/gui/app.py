@@ -3,6 +3,7 @@
 Start it with ``moldgen gui`` or :func:`run`. The browser tab shows the part
 coloured by the parting analysis, the parting plane, the mold settings and,
 after generating, an exploded view of the mold pieces with a zip download.
+When the mold has a planned piece layout the part is coloured by piece instead.
 This module holds the controls and jobs; the 3D scene lives in
 :class:`moldgen.gui.viewer.Viewer`.
 
@@ -232,7 +233,16 @@ class MoldGui:
                 "Pieces",
                 tuple(st.PIECE_OPTIONS),
                 initial_value=st.label_for(st.PIECE_OPTIONS, d.pieces),
-                hint="Four pieces also split each half, which helps with deep or wide parts.",
+                hint="Automatic adds side pieces where the two halves cannot release the part. "
+                "Four pieces split each half once more, which helps with deep or wide parts.",
+            )
+            self.max_pieces = gui.add_slider(
+                "Max pieces",
+                min=st.MAX_PIECES_RANGE[0],
+                max=st.MAX_PIECES_RANGE[1],
+                step=1,
+                initial_value=d.max_pieces,
+                hint="Most pieces Automatic may use. Areas still locked are filled in the cavity.",
             )
             self.wall_auto = gui.add_checkbox(
                 "Auto wall", d.wall_auto, hint="Derive the wall thickness from the part size."
@@ -330,6 +340,7 @@ class MoldGui:
                 st.text_html("Settings changed. Generate again to update the mold."),
                 visible=False,
             )
+            self.legend = gui.add_html("")
             self.summary = gui.add_html("")
             self.warnings = gui.add_html("", visible=False)
             self.download = gui.add_button("Download mold (.zip)", icon=viser.Icon.DOWNLOAD)
@@ -345,6 +356,7 @@ class MoldGui:
             self.material,
             self.print_material,
             self.pieces,
+            self.max_pieces,
             self.wall_auto,
             self.wall,
             self.keys,
@@ -437,6 +449,7 @@ class MoldGui:
             material=self._material_options[self.material.value],
             print_material=self._print_options[self.print_material.value],
             pieces=st.PIECE_OPTIONS[self.pieces.value],
+            max_pieces=int(self.max_pieces.value),
             wall_auto=self.wall_auto.value,
             wall_thickness=float(self.wall.value),
             keys=int(self.keys.value),
@@ -474,6 +487,7 @@ class MoldGui:
             self.material,
             self.print_material,
             self.pieces,
+            self.max_pieces,
             self.wall_auto,
             self.keys,
             self.clearance,
@@ -484,6 +498,7 @@ class MoldGui:
             self.orient,
         ):
             handle.disabled = generating
+        self.max_pieces.visible = self.pieces.value == st.AUTO_PIECES
         self.wall.disabled = generating or self.wall_auto.value
         self.sprue.disabled = generating or self.sprue_auto.value
         self.shrink.disabled = generating or self.shrink_auto.value
@@ -605,7 +620,11 @@ class MoldGui:
             if self._result is None or self._result_outdated:
                 return
             self._result_outdated = True
+            parting = self._parting
         self.result_note.visible = True
+        if parting is not None:
+            # The piece colours describe the old mold; go back to the analysis colours.
+            self.viewer.show_classes(np.asarray(parting.face_class))
 
     def _on_visibility(self, _event: Any) -> None:
         self.viewer.set_visibility(part=self.show_part.value, pieces=self.show_pieces.value)
@@ -906,7 +925,19 @@ class MoldGui:
             self.explode.value = round(0.3 * part_extent, 1)
         self.viewer.show_mold(result, float(self.explode.value))
         self.viewer.frame_mold()
-        self.summary.content = st.summary_html(summary(result))
+        layout = result.layout
+        if layout is not None:
+            self.viewer.show_piece_regions(
+                st.face_pieces(
+                    layout.face_region,
+                    len(layout.caps),
+                    layout.top_needed,
+                    [piece.name for piece in result.pieces],
+                )
+            )
+        info = summary(result)
+        self.legend.content = st.swatch_html(st.legend_rows(info))
+        self.summary.content = st.summary_html(info)
         self.warnings.content = st.warnings_html(result.warnings)
         self.warnings.visible = bool(result.warnings)
         self.result_note.visible = False
