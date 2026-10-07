@@ -331,6 +331,7 @@ def _build_config(
     parting_offset: float | None = None,
     pieces: int | str = _DEFAULTS.pieces,
     max_pieces: int = _DEFAULTS.max_pieces,
+    parting_surface: str = _DEFAULTS.parting_surface,
     wall: float | None = None,
     shrinkage_percent: float | None = None,
     sprue: float | None = None,
@@ -353,6 +354,7 @@ def _build_config(
         parting_offset=parting_offset,
         pieces=int(pieces) if str(pieces).isdigit() else pieces,
         max_pieces=max_pieces,
+        parting_surface=parting_surface,
         wall_thickness=wall,
         shrinkage=None if shrinkage_percent is None else shrinkage_percent / 100.0,
         sprue_diameter=sprue,
@@ -540,6 +542,11 @@ def _print_mold(ui: Ui, outcome: _Outcome, *, batch: bool) -> None:
     details.add_row("Mold size", _size(mold["outer_size_mm"]))
     details.add_row("Wall thickness", f"{mold['wall_thickness_mm']:.1f} mm")
     plane = f"{parting['direction_label']}, plane at {_mm(parting['offset_mm'])}"
+    if parting["surface"] == "curved":
+        plane = (
+            f"{parting['direction_label']}, curved surface "
+            f"(up to {parting['surface_rise_mm']:.1f} mm from flat)"
+        )
     layout = info["layout"]
     if layout and layout["side_pieces"]:
         details.add_row("Parting", plane)
@@ -547,6 +554,8 @@ def _print_mold(ui: Ui, outcome: _Outcome, *, batch: bool) -> None:
         if layout["filled_volume_cm3"] > 0:
             released += f"; {layout['locked_fraction']:.1%} of the surface filled"
         details.add_row("Side pieces", released)
+    elif layout:
+        details.add_row("Parting", f"{plane}, {layout['locked_fraction']:.1%} undercut")
     else:
         details.add_row("Parting", f"{plane}, {parting['undercut_fraction']:.1%} undercut")
     details.add_row("Pouring", pouring)
@@ -931,6 +940,15 @@ def make(
         int,
         _option("--max-pieces", help="Most pieces --pieces auto may use (2-10).", panel=_PARTING),
     ] = _DEFAULTS.max_pieces,
+    flat_parting: Annotated[
+        bool,
+        _option(
+            "--flat-parting",
+            help="Always split the halves with a flat plane, even where a curved surface "
+            "would release more of the part.",
+            panel=_PARTING,
+        ),
+    ] = False,
     wall: Annotated[
         float | None,
         _option(
@@ -1005,6 +1023,7 @@ def make(
             parting_offset=parting_offset,
             pieces=pieces,
             max_pieces=max_pieces,
+            parting_surface="flat" if flat_parting else "auto",
             wall=wall,
             shrinkage_percent=shrinkage,
             sprue=sprue,

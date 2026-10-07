@@ -38,6 +38,7 @@ from moldgen.parting import (
     releasable,
     release_tolerance_for,
 )
+from moldgen.surface import PartingSurface
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,9 @@ the release tolerance, so they are tested."""
 PARALLEL_COS = float(np.cos(np.radians(1.0)))
 """Cut planes whose normals are within this angle (as a cosine) count as parallel."""
 
+SURFACE_REFINE_LEVELS = 3
+"""Times the faces a curved parting surface crosses are split in four for the analysis."""
+
 SIDES = (0, 1, -1)
 """Cap extents: the whole remaining block, its top half, its bottom half."""
 
@@ -155,12 +159,21 @@ class CastFaces:
     carry no release requirement.
     """
 
-    def __init__(self, cavity: trimesh.Trimesh, gating: list[trimesh.Trimesh]) -> None:
+    def __init__(
+        self,
+        cavity: trimesh.Trimesh,
+        gating: list[trimesh.Trimesh],
+        surface: PartingSurface | None = None,
+    ) -> None:
         solids = [cavity, *gating]
         joined = trimesh.util.concatenate(solids) if gating else cavity
         vertices, faces, source = trimesh.remesh.subdivide_to_size(
             joined.vertices, joined.faces, MAX_EDGE_FRACTION * joined.scale, return_index=True
         )
+        if surface is not None and not surface.flat:
+            vertices, faces, source = _refine_across(
+                surface, vertices, faces, source, release_tolerance_for(joined)
+            )
         self.mesh = trimesh.Trimesh(vertices, faces, process=False)
         self.vertices = np.asarray(vertices, dtype=float)
         self.faces = np.asarray(faces, dtype=np.int64)
@@ -190,13 +203,17 @@ class CastFaces:
         self.plane_tolerance = 0.5 * PLANE_EPSILON * self.mesh.scale
         """Faces this close to a cap plane count as lying on it (for example the
         faces left where a filled region is clipped by the plane)."""
-        low, high = self.span(UP)
-        flat = (high <= self.tolerance) & (low >= -self.tolerance)
+        self.surface = surface if surface is not None and not surface.flat else None
+        """The curved parting surface between the halves, or None for the plane z == 0."""
         facing_up = self.normals[:, 2] >= 0
-        # Crossings of z == 0 shallower than the release tolerance do not count, and a
-        # face lying in the plane belongs to the side it faces, as in the two-piece analysis.
-        self.top = (high > self.tolerance) | (flat & facing_up)
-        self.bottom = (low < -self.tolerance) | (flat & ~facing_up)
+        self.plane_top, self.plane_bottom = self._sides(self.vertices[:, 2], facing_up)
+        """Faces above and below the plane z == 0, which limits half-limited caps."""
+        if self.surface is None:
+            self.top, self.bottom = self.plane_top, self.plane_bottom
+        else:
+            relative = self.vertices[:, 2] - self.surface.height(self.vertices[:, :2])
+            self.top, self.bottom = self._sides(relative, facing_up)
+        """Faces with some part in the top and in the bottom half."""
         self._solids = solids
         self._solid: Manifold | None = None
         self._released: dict[tuple[float, ...], np.ndarray] = {}
@@ -210,7 +227,8 @@ class CastFaces:
         """
         if sign not in self._vertical:
             origins = self.mesh.triangles_center + self.tolerance * self.normals
-            length = np.maximum(sign * origins[:, 2], 0.0)
+            floor = 0.0 if self.surface is None else self.surface.height(origins[:, :2])
+            length = np.maximum(sign * (origins[:, 2] - floor), 0.0)
             hit = ray_hit_distances(self.mesh, origins, -sign * UP)
             self._vertical[sign] = (origins, np.minimum(length, hit))
         return self._vertical[sign]
@@ -222,6 +240,20 @@ class CastFaces:
                 [to_manifold(s, "the cast") for s in self._solids], OpType.Add
             )
         return self._solid
+
+    def _sides(self, heights: np.ndarray, facing_up: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Faces above and below a parting surface, from vertex heights relative to it.
+
+        Crossings shallower than the release tolerance do not count, and a face
+        lying in the surface belongs to the side it faces, as in the two-piece
+        analysis.
+        """
+        face_heights = heights[self.faces]
+        low, high = face_heights.min(axis=1), face_heights.max(axis=1)
+        flat = (high <= self.tolerance) & (low >= -self.tolerance)
+        return (high > self.tolerance) | (flat & facing_up), (low < -self.tolerance) | (
+            flat & ~facing_up
+        )
 
     def released(self, direction: np.ndarray) -> np.ndarray:
         key = tuple(np.round(direction, 12))
@@ -239,11 +271,11 @@ class CastFaces:
         return float(self.area[locked].sum()) / self.total_area if self.total_area else 0.0
 
     def side(self, side: int) -> np.ndarray:
-        """Faces in the top half (1), the bottom half (-1) or anywhere (0)."""
+        """Faces above (1) or below (-1) the plane z == 0, or anywhere (0)."""
         if side > 0:
-            return self.top
+            return self.plane_top
         if side < 0:
-            return self.bottom
+            return self.plane_bottom
         return np.ones(len(self.faces), dtype=bool)
 
     def reaches(self, planes: list[Halfspace]) -> np.ndarray:
@@ -259,6 +291,40 @@ class CastFaces:
         for normal, value in planes:
             inside &= self.span(normal)[0] >= value - self.plane_tolerance
         return inside
+
+
+def _refine_across(
+    surface: PartingSurface,
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    source: np.ndarray,
+    tolerance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Subdivide the faces a curved parting surface runs through.
+
+    A face crossing the surface touches both halves and so must release both
+    ways; making those faces small keeps that strip along the outline narrow.
+    """
+    for _ in range(SURFACE_REFINE_LEVELS):
+        relative = vertices[:, 2] - surface.height(vertices[:, :2])
+        face_relative = relative[faces]
+        crossing = (face_relative.min(axis=1) < -tolerance) & (
+            face_relative.max(axis=1) > tolerance
+        )
+        if not crossing.any():
+            break
+        split = np.flatnonzero(crossing)
+        vertices, new_faces, children = trimesh.remesh.subdivide(
+            vertices, faces, face_index=split, return_index=True
+        )
+        # Unsplit faces come first, in order; ``children`` maps each split face to its parts.
+        parent = np.empty(len(new_faces), dtype=np.int64)
+        kept = np.setdiff1d(np.arange(len(faces)), split)
+        parent[: len(kept)] = kept
+        for old, new in children.items():
+            parent[new] = old
+        faces, source = new_faces, np.asarray(source)[parent]
+    return vertices, faces, source
 
 
 def core_sides(cast: CastFaces, caps: list[Cap]) -> tuple[np.ndarray, np.ndarray]:
@@ -317,13 +383,14 @@ def plan_layout(
     max_pieces: int,
     *,
     caps: list[Cap] | None = None,
+    surface: PartingSurface | None = None,
 ) -> tuple[PieceLayout, trimesh.Trimesh]:
     """Plan side pieces for ``cavity`` and return the layout and the cavity to cut.
 
     ``caps`` skips the search when the caps are already known. Areas no piece
     can release are filled; the returned cavity then differs from ``cavity``.
     """
-    cast = CastFaces(cavity, gating)
+    cast = CastFaces(cavity, gating, surface)
     if caps is None:
         caps = plan_caps(cast, max_pieces - 2)
     locked = locked_faces(cast, caps)
@@ -338,7 +405,7 @@ def plan_layout(
         cut, layout.filled_volume = fill_locked(cavity, cast, caps, block_bounds)
         cut, island_volume = _absorb_islands(cut, gating, block_bounds)
         layout.filled_volume += island_volume
-        final = CastFaces(cut, gating) if layout.filled_volume > 0 else cast
+        final = CastFaces(cut, gating, surface) if layout.filled_volume > 0 else cast
         layout.remaining_locked_fraction = final.locked_area(locked_faces(final, caps))
     if caps:
         in_top, _ = core_sides(final, caps)
@@ -413,6 +480,8 @@ def plan_caps(
     locked = locked_faces(cast, caps)
     min_gain = MIN_GAIN_FRACTION * cast.total_area
     candidates = _sphere_directions(directions)
+    # A cap limited to one side of z == 0 would cut across a curved parting surface.
+    sides = SIDES if cast.surface is None else (0,)
     while len(caps) < max_caps and cast.area[locked].sum() >= min_gain:
         in_top, in_bottom = core_sides(cast, caps)
         patches = [(mask, np.unique(cast.faces[mask])) for mask in _patches(cast, locked)]
@@ -426,7 +495,7 @@ def plan_caps(
                 if cast.area[patch[0] & frame.normal_ok].sum()
                 >= PATCH_RELEASE_SHARE * cast.area[patch[0]].sum()
             ]
-            for side in SIDES:
+            for side in sides:
                 if side * direction[2] < -NORMAL_EPS:
                     continue  # a half-limited cap may not move into the other half
                 for patch in [None, *usable]:
@@ -509,12 +578,12 @@ def fill_locked(
         prisms = []
         for triangle in cast.mesh.triangles[leaning]:
             flat = triangle.copy()
-            flat[:, 2] = 0.0
+            flat[:, 2] = 0.0 if cast.surface is None else cast.surface.height(triangle[:, :2])
             prism = Manifold.hull_points(np.vstack([triangle, flat]))
             if prism.volume() > 0:
                 prisms.append(prism)
         if prisms:
-            half = core_half(block_bounds, caps, sign)
+            half = core_half(block_bounds, caps, sign, cast.surface)
             solid = solid + (Manifold.batch_boolean(prisms, OpType.Add) ^ half)
     if solid.volume() <= before:
         return cavity, 0.0
@@ -538,10 +607,16 @@ def cap_region(cap: Cap, remaining: Manifold) -> Manifold:
     return trim(remaining, cap.halfspaces())
 
 
-def core_half(block_bounds: np.ndarray, caps: list[Cap], sign: int) -> Manifold:
+def core_half(
+    block_bounds: np.ndarray, caps: list[Cap], sign: int, surface: PartingSurface | None = None
+) -> Manifold:
     """The region of the top (``sign == 1``) or bottom half left after the caps."""
     block = block_solid(block_bounds)
-    region = block.trim_by_plane((0.0, 0.0, float(sign)), 0.0)
+    if surface is None:
+        region = block.trim_by_plane((0.0, 0.0, float(sign)), 0.0)
+    else:
+        below = surface.below(float(block_bounds[0][2]) - surface.cell)
+        region = block ^ below if sign < 0 else block - below
     reach = [trim(block, cap.halfspaces()) for cap in caps if cap.side in (0, sign)]
     if reach:
         region = region - Manifold.batch_boolean(reach, OpType.Add)

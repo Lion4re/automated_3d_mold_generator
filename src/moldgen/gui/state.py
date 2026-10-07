@@ -26,6 +26,7 @@ from moldgen.parting import FACE_LOW_DRAFT, FACE_OK, FACE_UNDERCUT
 if TYPE_CHECKING:
     from moldgen.parting import PartingResult
     from moldgen.pipeline import PreparedPart
+    from moldgen.surface import PartingSurface
 
 RGB = tuple[int, int, int]
 
@@ -75,6 +76,7 @@ UNIT_LABELS: dict[str, str] = {
 AUTO_PIECES = "Automatic"
 PIECE_OPTIONS: dict[str, int | str] = {AUTO_PIECES: "auto", "2 pieces": 2, "4 pieces": 4}
 MAX_PIECES_RANGE = (MIN_AUTO_PIECES, MAX_AUTO_PIECES)
+PARTING_SURFACE_OPTIONS: dict[str, str] = {"Curved where needed": "auto", "Flat": "flat"}
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +98,7 @@ class MoldSettings:
     print_material: str = "pla"
     pieces: int | str = "auto"
     max_pieces: int = 6
+    parting_surface: str = "auto"
     wall_auto: bool = True
     wall_thickness: float = 10.0
     keys: int = 4
@@ -126,6 +129,7 @@ class MoldSettings:
             print_material=print_material,
             pieces=config.pieces,
             max_pieces=config.max_pieces,
+            parting_surface=config.parting_surface,
             wall_auto=config.wall_thickness is None,
             wall_thickness=config.wall_thickness or material.min_wall_mm,
             keys=config.keys,
@@ -160,6 +164,7 @@ def to_config(settings: MoldSettings, parting: PartingResult | None = None) -> M
         parting_offset=offset,
         pieces=settings.pieces if settings.pieces == "auto" else int(settings.pieces),
         max_pieces=int(settings.max_pieces),
+        parting_surface=settings.parting_surface,
         wall_thickness=None if settings.wall_auto else float(settings.wall_thickness),
         shrinkage=float(settings.shrinkage_percent) / 100.0
         if settings.shrinkage_override
@@ -355,6 +360,28 @@ def quad_outline(half_size: tuple[float, float]) -> np.ndarray:
     """(4, 2, 3) line segments along the edge of :func:`quad_mesh`."""
     corners, _ = quad_mesh(half_size)
     return np.stack([corners, np.roll(corners, -1, axis=0)], axis=1)
+
+
+def surface_mesh(
+    surface: PartingSurface, block_bounds: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vertices and faces of a parting surface, clipped to the block's XY bounds (mold frame).
+
+    The grid is triangulated like :meth:`PartingSurface.below`: each cell is split
+    along its (i, j)-(i+1, j+1) diagonal.
+    """
+    nx, ny = surface.heights.shape
+    vertices = np.column_stack([surface.nodes(), surface.heights.ravel()])
+    index = np.arange(nx * ny).reshape(nx, ny)
+    a, b = index[:-1, :-1].ravel(), index[1:, :-1].ravel()
+    c, d = index[1:, 1:].ravel(), index[:-1, 1:].ravel()
+    faces = np.vstack([np.column_stack([a, b, c]), np.column_stack([a, c, d])])
+    lo, hi = np.asarray(block_bounds, dtype=float)
+    for normal, origin in (((1, 0, 0), lo), ((-1, 0, 0), hi), ((0, 1, 0), lo), ((0, -1, 0), hi)):
+        vertices, faces = trimesh.intersections.slice_faces_plane(
+            vertices, faces, np.asarray(normal, dtype=float), origin
+        )[:2]
+    return np.asarray(vertices, dtype=np.float32), np.asarray(faces, dtype=np.uint32)
 
 
 def offset_from_position(position: Sequence[float], direction: Sequence[float]) -> float:
@@ -637,7 +664,12 @@ def readout_html(undercut: float | None, low_draft: float | None) -> str:
             FACE_LOW_DRAFT: _percent(low_draft),
             FACE_UNDERCUT: _percent(undercut),
         }
-    return swatch_html(
+    caption = (
+        f'<div style="{DIMMED};font-size:0.8em;padding:0.3em 0.75em 0.1em">'
+        "For a flat cut at the plane shown. Generate to see the result of the actual "
+        "mold, which may curve or add side pieces.</div>"
+    )
+    return caption + swatch_html(
         [
             (FACE_LABELS[c], values[c], FACE_COLORS[c])
             for c in (FACE_OK, FACE_LOW_DRAFT, FACE_UNDERCUT)
@@ -672,29 +704,38 @@ def summary_html(info: Mapping[str, Any]) -> str:
     mold = info["mold"]
     parting = info["parting"]
     sprue = f"{mold['sprue_diameter_mm']:.1f} mm" + (", with funnel" if mold["funnel"] else "")
+    layout = info.get("layout")
+    if parting.get("surface") == "curved":
+        split = f"curved surface, up to {parting['surface_rise_mm']:.1f} mm from flat"
+    else:
+        split = "flat plane"
+    # What can still lock in this mold, after the cut, any side pieces and any filling.
+    if not layout:
+        undercut = parting["undercut_fraction"]
+    elif layout["filled_volume_cm3"] > 0:
+        undercut = layout["remaining_locked_fraction"]
+    else:
+        undercut = layout["locked_fraction"]
     rows = [
         ("Outer size", format_size(mold["outer_size_mm"])),
         ("Wall", f"{mold['wall_thickness_mm']:.1f} mm"),
-        (
-            "Parting",
-            f"{parting['direction_label']}, {_percent(parting['undercut_fraction'])} undercut",
-        ),
+        ("Parting", f"{parting['direction_label']}, {split}"),
+        ("Undercut", f"{_percent(undercut)} of the surface"),
         ("Sprue", sprue),
         ("Air vents", str(mold["vents"])),
         ("Keys", f"{mold['keys']}, {mold['key_clearance_mm']:.2f} mm clearance"),
         ("Cast volume", f"{info['material']['cast_volume_cm3']:.2f} cm³"),
     ]
-    layout = info.get("layout")
-    if layout:
+    if layout and layout["side_pieces"]:
         rows.append(("Removal order", ", ".join(p["name"] for p in info["pieces"])))
-        if layout["locked_fraction"] > 0:
-            rows.append(
-                (
-                    "Filled",
-                    f"{_percent(layout['locked_fraction'])} of the surface, "
-                    f"{layout['filled_volume_cm3']:.2f} cm³ added to the cast",
-                )
+    if layout and layout["filled_volume_cm3"] > 0:
+        rows.append(
+            (
+                "Filled",
+                f"{_percent(layout['locked_fraction'])} of the surface, "
+                f"{layout['filled_volume_cm3']:.2f} cm³ added to the cast",
             )
+        )
     table = [
         '<div style="display:grid;grid-template-columns:1fr auto auto;column-gap:0.75em;'
         f'row-gap:0.15em;margin-top:0.6em;{NUMERIC}">',

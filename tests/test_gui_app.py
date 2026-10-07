@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import shapely
 import trimesh
 
 from moldgen.booleans import difference
@@ -104,6 +105,63 @@ def test_automatic_pieces_colour_the_part_by_piece(app, tmp_path):
     app._on_mold_setting(None)
     assert not app.max_pieces.visible
     assert set(app.viewer._part_nodes) <= {"ok", "low_draft", "undercut"}
+
+
+def test_curved_parting_surface_replaces_the_plane(app, tmp_path):
+    t = np.linspace(-1, 1, 60)
+    path = np.column_stack([40 * t, 12 * np.sin(2 * t), 10 * t**2 - 3])
+    tube = trimesh.creation.sweep_polygon(shapely.Point(0, 0).buffer(4, quad_segs=16), path)
+    stl = tmp_path / "tube.stl"
+    tube.export(stl)
+    app.open_path(stl)
+    _wait(app)
+    app.pieces.value = "2 pieces"
+    app._on_mold_setting(None)
+    assert app.parting_surface.visible and app.parting_surface.value == "Curved where needed"
+
+    app._on_generate(SimpleNamespace(client=None))
+    _wait(app)
+    if app._result.surface is None:
+        app.direction.value = "Z axis"
+        app._on_direction(None)
+        _wait(app)
+        app._on_generate(SimpleNamespace(client=None))
+        _wait(app)
+    result = app._result
+    assert result.surface is not None and not result.surface.flat
+    assert "curved surface, up to" in app.summary.content
+    assert f"{100 * result.layout.locked_fraction:.1f} % of the surface" in app.summary.content
+    assert result.layout.locked_fraction < 0.01
+    assert app.viewer._part_nodes, "the part stays visible"
+    surface = app.viewer._surface
+    assert surface is not None
+    # In the mold frame the surface spans the block and stays at the fitted heights.
+    to_mold = np.linalg.inv(result.parting.from_mold)
+    points = trimesh.transform_points(np.asarray(surface.vertices, float), to_mold)
+    block = result.block_bounds
+    assert points[:, :2].min(axis=0) == pytest.approx(block[0, :2], abs=1e-3)
+    assert points[:, :2].max(axis=0) == pytest.approx(block[1, :2], abs=1e-3)
+    assert points[:, 2] == pytest.approx(result.surface.height(points[:, :2]), abs=1e-3)
+
+    # The surface takes the plane's place and follows the "Show plane" toggle.
+    assert not surface.visible and not app.viewer._plane.visible
+    app.show_pieces.value = False
+    app._on_visibility(None)
+    assert surface.visible and not app.viewer._plane.visible
+    app.show_plane.value = False
+    app._on_show_plane(None)
+    assert not surface.visible
+    app.show_plane.value = True
+    app._on_show_plane(None)
+
+    # Changing a setting brings the analysis and the flat plane back.
+    app.keys.value = 2
+    app._on_mold_setting(None)
+    assert app.viewer._surface is None and app.viewer._plane.visible
+
+    app.pieces.value = "4 pieces"
+    app._on_mold_setting(None)
+    assert not app.parting_surface.visible
 
 
 def test_unreadable_upload_is_reported(app):
