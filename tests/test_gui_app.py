@@ -129,7 +129,9 @@ def test_curved_parting_surface_replaces_the_plane(app, tmp_path):
         _wait(app)
     result = app._result
     assert result.surface is not None and not result.surface.flat
-    assert "curved (up to" in app.summary.content
+    assert "curved surface, up to" in app.summary.content
+    assert f"{100 * result.layout.locked_fraction:.1f} % of the surface" in app.summary.content
+    assert result.layout.locked_fraction < 0.01
     assert app.viewer._part_nodes, "the part stays visible"
     surface = app.viewer._surface
     assert surface is not None

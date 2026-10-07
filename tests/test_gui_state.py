@@ -184,8 +184,19 @@ def test_summary_names_a_curved_parting_and_its_rise():
         },
         "material": {"cast_volume_cm3": 1.0},
         "pieces": [],
-        "layout": None,
+        "layout": {
+            "side_pieces": 0,
+            "locked_fraction": 0.001,
+            "filled_volume_cm3": 0.0,
+            "remaining_locked_fraction": 0.001,
+        },
     }
-    assert "+Z, curved (up to 4.2 mm from flat)" in st.summary_html(info)
+    html = st.summary_html(info)
+    # The undercut is the curved mold's own, not the flat-plane figure.
+    assert "+Z, curved surface, up to 4.2 mm from flat" in html
+    assert "0.1 % of the surface" in html
+    assert "Removal order" not in html and "Filled" not in html
     info["parting"].update(surface="flat", surface_rise_mm=0.0)
-    assert "+Z, 10.0 % undercut" in st.summary_html(info)
+    info["layout"] = None
+    html = st.summary_html(info)
+    assert "+Z, flat plane" in html and "10.0 % of the surface" in html

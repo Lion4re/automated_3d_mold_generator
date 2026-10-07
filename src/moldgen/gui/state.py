@@ -664,7 +664,12 @@ def readout_html(undercut: float | None, low_draft: float | None) -> str:
             FACE_LOW_DRAFT: _percent(low_draft),
             FACE_UNDERCUT: _percent(undercut),
         }
-    return swatch_html(
+    caption = (
+        f'<div style="{DIMMED};font-size:0.8em;padding:0.3em 0.75em 0.1em">'
+        "For a flat cut at the plane shown. Generate to see the result of the actual "
+        "mold, which may curve or add side pieces.</div>"
+    )
+    return caption + swatch_html(
         [
             (FACE_LABELS[c], values[c], FACE_COLORS[c])
             for c in (FACE_OK, FACE_LOW_DRAFT, FACE_UNDERCUT)
@@ -699,30 +704,38 @@ def summary_html(info: Mapping[str, Any]) -> str:
     mold = info["mold"]
     parting = info["parting"]
     sprue = f"{mold['sprue_diameter_mm']:.1f} mm" + (", with funnel" if mold["funnel"] else "")
+    layout = info.get("layout")
     if parting.get("surface") == "curved":
-        split = f"curved (up to {parting['surface_rise_mm']:.1f} mm from flat)"
+        split = f"curved surface, up to {parting['surface_rise_mm']:.1f} mm from flat"
     else:
-        split = f"{_percent(parting['undercut_fraction'])} undercut"
+        split = "flat plane"
+    # What can still lock in this mold, after the cut, any side pieces and any filling.
+    if not layout:
+        undercut = parting["undercut_fraction"]
+    elif layout["filled_volume_cm3"] > 0:
+        undercut = layout["remaining_locked_fraction"]
+    else:
+        undercut = layout["locked_fraction"]
     rows = [
         ("Outer size", format_size(mold["outer_size_mm"])),
         ("Wall", f"{mold['wall_thickness_mm']:.1f} mm"),
         ("Parting", f"{parting['direction_label']}, {split}"),
+        ("Undercut", f"{_percent(undercut)} of the surface"),
         ("Sprue", sprue),
         ("Air vents", str(mold["vents"])),
         ("Keys", f"{mold['keys']}, {mold['key_clearance_mm']:.2f} mm clearance"),
         ("Cast volume", f"{info['material']['cast_volume_cm3']:.2f} cm³"),
     ]
-    layout = info.get("layout")
-    if layout:
+    if layout and layout["side_pieces"]:
         rows.append(("Removal order", ", ".join(p["name"] for p in info["pieces"])))
-        if layout["locked_fraction"] > 0:
-            rows.append(
-                (
-                    "Filled",
-                    f"{_percent(layout['locked_fraction'])} of the surface, "
-                    f"{layout['filled_volume_cm3']:.2f} cm³ added to the cast",
-                )
+    if layout and layout["filled_volume_cm3"] > 0:
+        rows.append(
+            (
+                "Filled",
+                f"{_percent(layout['locked_fraction'])} of the surface, "
+                f"{layout['filled_volume_cm3']:.2f} cm³ added to the cast",
             )
+        )
     table = [
         '<div style="display:grid;grid-template-columns:1fr auto auto;column-gap:0.75em;'
         f'row-gap:0.15em;margin-top:0.6em;{NUMERIC}">',
