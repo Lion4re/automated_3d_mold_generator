@@ -332,6 +332,7 @@ def _build_config(
     pieces: int | str = _DEFAULTS.pieces,
     max_pieces: int = _DEFAULTS.max_pieces,
     parting_surface: str = _DEFAULTS.parting_surface,
+    side_piece_cuts: str = _DEFAULTS.side_piece_cuts,
     wall: float | None = None,
     shrinkage_percent: float | None = None,
     sprue: float | None = None,
@@ -355,6 +356,7 @@ def _build_config(
         pieces=int(pieces) if str(pieces).isdigit() else pieces,
         max_pieces=max_pieces,
         parting_surface=parting_surface,
+        side_piece_cuts=side_piece_cuts,
         wall_thickness=wall,
         shrinkage=None if shrinkage_percent is None else shrinkage_percent / 100.0,
         sprue_diameter=sprue,
@@ -940,6 +942,14 @@ def make(
         int,
         _option("--max-pieces", help="Most pieces --pieces auto may use (2-10).", panel=_PARTING),
     ] = _DEFAULTS.max_pieces,
+    flat_side_pieces: Annotated[
+        bool,
+        _option(
+            "--flat-side-pieces",
+            help="Cut side pieces with flat planes only; faster for parts that need them.",
+            panel=_PARTING,
+        ),
+    ] = False,
     flat_parting: Annotated[
         bool,
         _option(
@@ -1024,6 +1034,7 @@ def make(
             pieces=pieces,
             max_pieces=max_pieces,
             parting_surface="flat" if flat_parting else "auto",
+            side_piece_cuts="flat" if flat_side_pieces else "auto",
             wall=wall,
             shrinkage_percent=shrinkage,
             sprue=sprue,

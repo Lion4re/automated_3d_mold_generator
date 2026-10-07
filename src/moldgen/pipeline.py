@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import manifold3d
 import numpy as np
@@ -17,7 +18,7 @@ import trimesh
 from moldgen import booleans
 from moldgen.config import MoldConfig
 from moldgen.gating import POUR_DIRECTIONS, GatingPlan, cross_section_to_shapely, plan_gating
-from moldgen.keys import KeyPlan, plan_keys, plan_keys_on_plane, plane_basis
+from moldgen.keys import KeyPlan, plan_keys, plan_keys_in_region, plan_keys_on_plane, plane_basis
 from moldgen.materials import (
     Material,
     PrintMaterial,
@@ -61,12 +62,15 @@ MIN_KEY_MARGIN_MM = 1.0
 MAX_KEY_MARGIN_MM = 3.0
 SECONDARY_KEYS_PER_SEAM = 2
 SIDE_PIECE_KEYS = 2
+KEY_BACKING_MM = 1.5
+"""Mold that must lie behind a key on a curved cut, so its socket has a piece to go into."""
 SEAM_SLAB_HALF_MM = 0.05
 """Half thickness of the slabs that keep keys of one seam off the other seams."""
 NOTICEABLE_FILL_MM3 = 10.0
 """Filling smaller than this (0.01 cm³) is reported in the summary but not warned about."""
-SLIVER_VOLUME_FRACTION = 1e-6
-"""Shells of the mold body smaller than this share of its volume are numerical slivers."""
+SLIVER_VOLUME_FRACTION = 1e-4
+"""Shells of the mold body smaller than this share of its volume are slivers, such as the
+bit of an air vent that crosses a hole's core, not a part of the cavity left unfilled."""
 REMOVAL_STEPS_FRACTION = (0.01, 0.05, 0.2, 1.0)
 """Distances (times the block size) each piece is slid along its pull to check removal."""
 REMOVAL_OVERLAP_FRACTION = 1e-4
@@ -124,6 +128,8 @@ class MoldResult:
     """Side pieces and locked-area report when ``config.pieces == "auto"``."""
     surface: PartingSurface | None = None
     """The curved parting surface between the halves, or None for the plane z == 0."""
+    pieces_catch: bool = False
+    """True when sliding the finished pieces out found one that may catch (see warnings)."""
 
     def save(self, out_dir: str | Path) -> list[Path]:
         from moldgen.report import save_result
@@ -265,6 +271,7 @@ def generate_mold(
     """
     config = config or MoldConfig()
     config.validate()
+    given_parting = parting
     material = get_material(config.material)
     print_material = get_print_material(config.print_material)
     stages = _Stages(progress, total=7 if config.pieces == 2 else 8)
@@ -283,7 +290,9 @@ def generate_mold(
             draft_threshold_deg=config.draft_threshold_deg,
         )
     if config.pieces == "auto" and config.direction == "auto" and config.parting_offset is None:
-        main = choose_main_direction(part.mesh, parting, config.max_pieces)
+        main = choose_main_direction(
+            part.mesh, parting, config.max_pieces, curved=config.side_piece_cuts == "auto"
+        )
         if main is not None and not np.allclose(main.direction, parting.direction):
             parting = analyze_parting(
                 part.mesh,
@@ -332,12 +341,10 @@ def generate_mold(
     surface = None
     if config.pieces == "auto":
         stages.start("Planning the mold pieces")
-        gating = _gating_for_pieces(cavity, gating, place_gating, config.max_pieces)
-        surface = _curved_surface(cavity, gating, block_bounds, config)
-        layout, cavity = plan_layout(
-            cavity, gating.solids(), block_bounds, config.max_pieces, surface=surface
+        gating = _gating_for_pieces(
+            cavity, gating, place_gating, config.max_pieces, config.side_piece_cuts == "auto"
         )
-        warnings.extend(_layout_warnings(layout))
+        surface = _curved_surface(cavity, gating, block_bounds, config)
     elif config.pieces == 2:
         surface = _curved_surface(cavity, gating, block_bounds, config)
         undercut = parting.undercut_fraction
@@ -358,35 +365,64 @@ def generate_mold(
             f"{gating.unvented} air pockets have no vent and may leave bubbles in the cast"
         )
     gating_solids = gating.solids()
-
-    stages.start("Cutting the cavity and splitting the mold")
-    body = booleans.difference(block, [cavity, *gating_solids])
-    if _enclosed_voids(body):
-        warnings.append(
-            "Part of the cavity is not reachable from the sprue (for example a separate body), "
-            "so it will not fill when pouring."
-        )
-    stages.start("Adding registration keys")
     key_radius, key_margin = auto_key_size(wall, config.clearance)
     if config.key_diameter:
         key_radius = config.key_diameter / 2
-    obstacles = [cavity, *gating_solids]
-    if (layout is not None and layout.caps) or surface is not None:
-        pieces, key_plans = _layout_pieces(
-            body,
-            layout or PieceLayout(),
-            obstacles,
-            block_bounds,
-            config,
-            key_radius,
-            key_margin,
-            warnings,
-            surface,
-        )
-    else:
-        pieces, key_plans = _halves(
-            body, gating, obstacles, block_bounds, config, key_radius, key_margin, warnings, stages
-        )
+    part_cavity = cavity
+
+    def assemble(curved: bool) -> tuple[Any, ...]:
+        """Plan (for "auto"), cut and key the pieces; returns what generate_mold keeps."""
+        notes: list[str] = []
+        plan, cut = layout, part_cavity
+        if config.pieces == "auto":
+            plan, cut = plan_layout(
+                part_cavity,
+                gating_solids,
+                block_bounds,
+                config.max_pieces,
+                surface=surface,
+                curved=curved,
+            )
+            notes.extend(_layout_warnings(plan))
+        stages.start("Cutting the cavity and splitting the mold")
+        body = booleans.difference(block, [cut, *gating_solids])
+        if _enclosed_voids(body):
+            notes.append(
+                "Part of the cavity is not reachable from the sprue (for example a separate "
+                "body), so it will not fill when pouring."
+            )
+        stages.start("Adding registration keys")
+        obstacles = [cut, *gating_solids]
+        problems: list[str] = []
+        if (plan is not None and plan.caps) or surface is not None:
+            built, keys = _layout_pieces(
+                body,
+                plan or PieceLayout(),
+                obstacles,
+                block_bounds,
+                config,
+                key_radius,
+                key_margin,
+                notes,
+                surface,
+                problems,
+            )
+        else:
+            built, keys = _halves(
+                body, gating, obstacles, block_bounds, config, key_radius, key_margin, notes, stages
+            )
+        return plan, cut, built, keys, problems, notes
+
+    layout, cavity, pieces, key_plans, problems, notes = assemble(
+        curved=config.side_piece_cuts == "auto"
+    )
+    curved_caps = layout is not None and any(cap.cut is not None for cap in layout.caps)
+    if problems and not curved_caps and surface is not None:
+        # The pieces as built would catch: a curved parting surface is the likely cause.
+        log.info("the pieces as planned would catch; trying again with a flat parting surface")
+        flat = replace(config, parting_surface="flat")
+        return generate_mold(part, flat, parting=given_parting, progress=progress)
+    warnings.extend(notes + problems)
 
     stages.start("Checking the result")
     for piece in pieces:
@@ -394,7 +430,7 @@ def generate_mold(
             raise MoldError(f"Mold piece {piece.name!r} came out broken (not a closed solid).")
 
     stages.finish()
-    return MoldResult(
+    result = MoldResult(
         config=config,
         material=material,
         print_material=print_material,
@@ -411,7 +447,25 @@ def generate_mold(
         timings=stages.timings,
         layout=layout,
         surface=surface,
+        pieces_catch=bool(problems),
     )
+    if curved_caps:
+        # The search with curved cuts is greedy, and the pieces it plans are checked
+        # less exactly; keep whichever of it and flat side pieces gives the better mold.
+        flat = generate_mold(
+            part, replace(config, side_piece_cuts="flat"), parting=given_parting, progress=progress
+        )
+        if _mold_score(flat) <= _mold_score(result):
+            return flat
+    return result
+
+
+def _mold_score(result: MoldResult) -> tuple[bool, float, int, float]:
+    """Lower is better: no piece that catches, less locked area, fewer pieces, less filling."""
+    layout = result.layout
+    locked = 0.0 if layout is None else round(layout.locked_fraction, 3)
+    filled = 0.0 if layout is None else layout.filled_volume
+    return result.pieces_catch, locked, len(result.pieces), filled
 
 
 def _halves(
@@ -509,6 +563,7 @@ def _layout_pieces(
     key_margin: float,
     warnings: list[str],
     surface: PartingSurface | None = None,
+    problems: list[str] | None = None,
 ) -> tuple[list[MoldPiece], list[KeyPlan]]:
     """Cut ``body`` into the side pieces of ``layout`` and the two halves, in removal order.
 
@@ -527,7 +582,15 @@ def _layout_pieces(
     for k, cap in enumerate(caps):
         piece = cap_region(cap, rest)
         rest = rest - piece
-        if config.keys > 0:
+        if config.keys > 0 and cap.cut is not None:
+            plan = _cut_keys(cap, caps[:k], block_bounds, config, key_radius, key_margin)
+            if not cap.bounds:
+                _check_key_count(plan, SIDE_PIECE_KEYS, f"side piece {k + 1}", warnings)
+            if len(plan.positions):
+                piece = piece + _joined(plan.male_solids())
+                rest = rest - _joined(plan.female_solids())
+                key_plans.append(plan)
+        elif config.keys > 0:
             rows = plane_basis(-cap.direction)
             behind = trim(remaining, [(-cap.direction, -cap.offset), *cap.halfspaces()[1:]])
             face = _section(cap_region(cap, remaining), rows, -cap.offset - inset).intersection(
@@ -604,7 +667,9 @@ def _layout_pieces(
     solids += [("top", top, UP), ("bottom", bottom, -UP)]
     block_volume = float(np.prod(block_bounds[1] - block_bounds[0]))
     solids = [item for item in solids if item[1].volume() > SLIVER_VOLUME_FRACTION * block_volume]
-    warnings.extend(_removal_warnings(solids, obstacles, block_bounds))
+    (warnings if problems is None else problems).extend(
+        _removal_warnings(solids, obstacles, block_bounds)
+    )
 
     pieces = []
     for name, solid, pull in solids:
@@ -653,6 +718,7 @@ def _gating_for_pieces(
     gating: GatingPlan,
     place_gating: Callable[[np.ndarray], GatingPlan],
     max_pieces: int,
+    curved: bool,
 ) -> GatingPlan:
     """Pick the pour side whose sprue and vents leave the side pieces the least locked area.
 
@@ -670,7 +736,9 @@ def _gating_for_pieces(
             except ValueError:
                 continue
         cast = CastFaces(cavity, option.solids())
-        caps = plan_caps(cast, max_pieces - 2, directions=QUICK_DIRECTIONS)
+        caps = plan_caps(
+            cast, max_pieces - 2, directions=QUICK_DIRECTIONS, quick=True, curved=curved
+        )
         locked = cast.locked_area(locked_faces(cast, caps))
         key = (round(locked, 3), len(caps), rank)
         if best_key is None or key < best_key:
@@ -691,6 +759,7 @@ def _curved_surface(
     """
     if config.parting_surface != "auto":
         return None
+    curved = config.side_piece_cuts == "auto"
     solids = gating.solids()
     candidate = fit_surface(trimesh.util.concatenate([cavity, *solids]), block_bounds, gating)
     if candidate.flat:
@@ -700,7 +769,9 @@ def _curved_surface(
         cast = CastFaces(cavity, solids, surface)
         caps = []
         if config.pieces == "auto":
-            caps = plan_caps(cast, config.max_pieces - 2, directions=QUICK_DIRECTIONS)
+            caps = plan_caps(
+                cast, config.max_pieces - 2, directions=QUICK_DIRECTIONS, quick=True, curved=curved
+            )
         scores.append((round(cast.locked_area(locked_faces(cast, caps)), 3), len(caps)))
     return candidate if scores[1] < scores[0] else None
 
@@ -721,36 +792,13 @@ def _surface_keys(
     usable = (surface.slope() <= KEY_MAX_SLOPE) & ~surface.covered
     points = np.column_stack([surface.nodes(), surface.heights.ravel()])
     for cap in caps:
-        reach = np.ones(len(points), dtype=bool)
-        for normal, value in cap.halfspaces():
-            reach &= points @ normal >= value
-        usable &= ~reach.reshape(usable.shape)
-    cells = usable[:-1, :-1] & usable[1:, :-1] & usable[:-1, 1:] & usable[1:, 1:]
-    x0, y0 = surface.origin
-    boxes = []
-    for i, row in enumerate(cells):
-        # One box per run of usable cells along the row keeps the union small.
-        edges = np.flatnonzero(np.diff(np.concatenate([[0], row.astype(np.int8), [0]])))
-        for start, end in zip(edges[::2], edges[1::2], strict=True):
-            boxes.append(
-                shapely.box(
-                    x0 + i * surface.cell,
-                    y0 + start * surface.cell,
-                    x0 + (i + 1) * surface.cell,
-                    y0 + end * surface.cell,
-                )
-            )
+        usable &= ~cap.contains(points).reshape(usable.shape)
     lo, hi = np.asarray(block_bounds, dtype=float)
-    region = shapely.union_all(boxes).intersection(shapely.box(lo[0], lo[1], hi[0], hi[1]))
-    rows = plane_basis(UP)
-    region = shapely.affinity.affine_transform(
-        region, [rows[0, 0], rows[0, 1], rows[1, 0], rows[1, 1], 0.0, 0.0]
-    )
-    plan = plan_keys_on_plane(
-        [],
-        UP,
-        0.0,
+    region = _grid_region(surface, usable).intersection(shapely.box(lo[0], lo[1], hi[0], hi[1]))
+    plan = plan_keys_in_region(
         region,
+        np.eye(3),
+        UP,
         count=config.keys,
         radius=key_radius,
         clearance=config.clearance,
@@ -759,6 +807,69 @@ def _surface_keys(
     if len(plan.positions):
         plan.positions[:, 2] = surface.height(plan.positions[:, :2])
     return plan
+
+
+def _cut_keys(
+    cap: Cap,
+    earlier: list[Cap],
+    block_bounds: np.ndarray,
+    config: MoldConfig,
+    key_radius: float,
+    key_margin: float,
+) -> KeyPlan:
+    """Keys on the stretches of a side piece's curved cut that run through mold, not cast.
+
+    They sit where the cut is gently sloped, inside the block and the piece's
+    box, with mold behind them that no earlier piece took. Male keys stand on
+    the side piece and point back along its pull, as on a flat cut.
+    """
+    cut = cap.cut
+    field, rows = cut.field, cut.rows
+    usable = (field.slope() <= KEY_MAX_SLOPE) & ~field.covered
+    on_cut = field.nodes() @ rows[:2] + field.heights.reshape(-1, 1) * rows[2]
+    behind = on_cut - KEY_BACKING_MM * rows[2]
+    lo, hi = np.asarray(block_bounds, dtype=float)
+    keep = np.ones(len(on_cut), dtype=bool)
+    for points in (on_cut, behind):
+        keep &= np.all((points >= lo) & (points <= hi), axis=1)
+        for normal, value in cap.halfspaces()[1:]:
+            keep &= points @ normal >= value
+        for other in earlier:
+            keep &= ~other.contains(points)
+    usable &= keep.reshape(usable.shape)
+    plan = plan_keys_in_region(
+        _grid_region(field, usable),
+        rows,
+        -cap.direction,
+        count=SIDE_PIECE_KEYS,
+        radius=key_radius,
+        clearance=config.clearance,
+        margin=key_margin,
+    )
+    if len(plan.positions):
+        uv = plan.positions @ rows[:2].T
+        plan.positions = plan.positions + field.height(uv)[:, None] * rows[2]
+    return plan
+
+
+def _grid_region(field: PartingSurface, usable: np.ndarray) -> shapely.Geometry:
+    """The grid cells whose four corners are usable, in the grid's own coordinates."""
+    cells = usable[:-1, :-1] & usable[1:, :-1] & usable[:-1, 1:] & usable[1:, 1:]
+    x0, y0 = field.origin
+    boxes = []
+    for i, row in enumerate(cells):
+        # One box per run of usable cells along the row keeps the union small.
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], row.astype(np.int8), [0]])))
+        for start, end in zip(edges[::2], edges[1::2], strict=True):
+            boxes.append(
+                shapely.box(
+                    x0 + i * field.cell,
+                    y0 + start * field.cell,
+                    x0 + (i + 1) * field.cell,
+                    y0 + end * field.cell,
+                )
+            )
+    return shapely.union_all(boxes) if boxes else shapely.Polygon()
 
 
 def _layout_warnings(layout: PieceLayout) -> list[str]:

@@ -201,6 +201,39 @@ def plan_keys_on_plane(
     return plan
 
 
+def plan_keys_in_region(
+    region: shapely.Geometry,
+    rows: np.ndarray,
+    normal: np.ndarray,
+    *,
+    count: int,
+    radius: float,
+    clearance: float,
+    margin: float,
+) -> KeyPlan:
+    """Spread up to ``count`` keys over ``region``, given in ``(dot(p, rows[0]), dot(p, rows[1]))``.
+
+    For curved mating faces: the caller keeps ``region`` clear of the cast and
+    of other seams, then moves each position along ``rows[2]`` onto the face.
+    Male keys protrude along ``normal``.
+    """
+    if count < 0 or radius <= 0 or clearance < 0 or margin < 0:
+        raise ValueError("count, clearance and margin must be non-negative and radius positive")
+    plan = KeyPlan(
+        normal=np.asarray(normal, dtype=float) / np.linalg.norm(normal),
+        positions=np.empty((0, 3)),
+        radius=float(radius),
+        clearance=float(clearance),
+    )
+    plan._check_size()
+    if count == 0:
+        return plan
+    allowed = region.buffer(-(plan.footprint_radius + margin))
+    spacing = max(KEY_SPACING_RADII * plan.radius, 2.0 * plan.footprint_radius + margin)
+    plan.positions = _spread_points(allowed, count, spacing) @ np.asarray(rows)[:2]
+    return plan
+
+
 def plane_basis(normal: np.ndarray) -> np.ndarray:
     """Right-handed rows ``(e1, e2, n)``: two in-plane unit vectors, then the unit normal."""
     n = np.asarray(normal, dtype=float).reshape(3)

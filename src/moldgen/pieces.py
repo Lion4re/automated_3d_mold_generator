@@ -29,6 +29,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 from moldgen.booleans import to_manifold, to_trimesh
+from moldgen.keys import plane_basis
 from moldgen.parting import (
     NORMAL_EPS,
     DirectionScore,
@@ -38,7 +39,7 @@ from moldgen.parting import (
     releasable,
     release_tolerance_for,
 )
-from moldgen.surface import PartingSurface
+from moldgen.surface import CUT_RAISE_ROUNDS, CutSurface, PartingSurface, fit_cut
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,19 @@ PARALLEL_COS = float(np.cos(np.radians(1.0)))
 SURFACE_REFINE_LEVELS = 3
 """Times the faces a curved parting surface crosses are split in four for the analysis."""
 
+SWEEP_SAMPLES = 32
+"""Points per path checked against curved caps when testing what a half sweeps past."""
+
+CAP_CELL_FRACTION = 0.004
+
+QUICK_CELL_FACTOR = 2.5
+"""Coarser grid for curved cuts when only comparing layouts."""
+"""Grid spacing of a curved cut, as a share of the cast's size."""
+
+OPEN_CUT_MARGIN_FRACTION = 0.35
+"""How far (times the cast size) an open curved cut's grid reaches past the cast, so it
+covers the whole mold block."""
+
 SIDES = (0, 1, -1)
 """Cap extents: the whole remaining block, its top half, its bottom half."""
 
@@ -122,10 +136,31 @@ class Cap:
     """1 or -1 limits the cap to the top or bottom half; 0 lets it span both."""
     bounds: tuple[Halfspace, ...] = ()
     """Side planes parallel to ``direction`` that box the cap in around one feature."""
+    cut: CutSurface | None = None
+    """A curved cut in place of the cut plane; ``offset`` is then its lowest point,
+    so the plane stays a bound the cap never crosses."""
 
     def planes(self) -> list[Halfspace]:
         """The cut plane and the side planes (the half limit is kept separately)."""
         return [(self.direction, self.offset), *self.bounds]
+
+    def contains(self, points: np.ndarray) -> np.ndarray:
+        """Whether each point lies in the cap's reach."""
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        inside = np.ones(len(points), dtype=bool)
+        for normal, value in self.halfspaces():
+            inside &= points @ normal >= value
+        if self.cut is not None:
+            inside &= self.cut.beyond(points) >= 0
+        return inside
+
+    def region(self, solid: Manifold) -> Manifold:
+        """The part of ``solid`` inside the cap's reach."""
+        solid = trim(solid, self.halfspaces())
+        if self.cut is not None:
+            reach = float(np.ptp(np.asarray(solid.bounding_box()).reshape(2, 3), axis=0).sum())
+            solid = solid ^ self.cut.solid(reach + 1.0)
+        return solid
 
     def halfspaces(self) -> list[Halfspace]:
         """Every half-space of the cap's reach, the half limit included."""
@@ -285,6 +320,22 @@ class CastFaces:
             reach &= self.span(normal)[1] > value + self.plane_tolerance
         return reach
 
+    def cap_reaches(self, cap: Cap) -> np.ndarray:
+        """Faces with some part strictly inside the cap's reach (the half limit aside)."""
+        reach = self.reaches(cap.planes())
+        if cap.cut is not None:
+            beyond = cap.cut.beyond(self.vertices)[self.faces]
+            reach &= beyond.max(axis=1) > self.plane_tolerance
+        return reach
+
+    def cap_within(self, cap: Cap) -> np.ndarray:
+        """Faces wholly inside the cap's reach (the half limit aside)."""
+        inside = self.within(cap.planes())
+        if cap.cut is not None:
+            beyond = cap.cut.beyond(self.vertices)[self.faces]
+            inside &= beyond.min(axis=1) >= -self.plane_tolerance
+        return inside
+
     def within(self, planes: list[Halfspace]) -> np.ndarray:
         """Faces wholly inside all ``planes``."""
         inside = np.ones(len(self.faces), dtype=bool)
@@ -331,7 +382,7 @@ def core_sides(cast: CastFaces, caps: list[Cap]) -> tuple[np.ndarray, np.ndarray
     """Faces that still touch the top and the bottom half after the caps are taken."""
     in_top, in_bottom = cast.top.copy(), cast.bottom.copy()
     for cap in caps:
-        taken = cast.within(cap.planes())
+        taken = cast.cap_within(cap)
         if cap.side >= 0:
             in_top &= ~taken
         if cap.side <= 0:
@@ -344,7 +395,7 @@ def owners(cast: CastFaces, caps: list[Cap]) -> np.ndarray:
     owned = np.zeros((len(cast.faces), len(caps) + 2), dtype=bool)
     for k, cap in enumerate(caps):
         in_top, in_bottom = core_sides(cast, caps[:k])
-        owned[:, k] = _on_side(in_top, in_bottom, cap.side) & cast.reaches(cap.planes())
+        owned[:, k] = _on_side(in_top, in_bottom, cap.side) & cast.cap_reaches(cap)
     owned[:, -2], owned[:, -1] = core_sides(cast, caps)
     return owned
 
@@ -359,7 +410,7 @@ def requirements(cast: CastFaces, caps: list[Cap]) -> np.ndarray:
     """
     required = np.zeros((len(cast.faces), len(caps) + 2), dtype=bool)
     for k, cap in enumerate(caps):
-        required[:, k] = cast.side(cap.side) & cast.reaches(cap.planes())
+        required[:, k] = cast.side(cap.side) & cast.cap_reaches(cap)
     in_top, in_bottom = core_sides(cast, caps)
     required[:, -2] = in_top | _swept(cast, caps, 1)
     required[:, -1] = in_bottom | _swept(cast, caps, -1)
@@ -384,6 +435,7 @@ def plan_layout(
     *,
     caps: list[Cap] | None = None,
     surface: PartingSurface | None = None,
+    curved: bool = True,
 ) -> tuple[PieceLayout, trimesh.Trimesh]:
     """Plan side pieces for ``cavity`` and return the layout and the cavity to cut.
 
@@ -392,7 +444,7 @@ def plan_layout(
     """
     cast = CastFaces(cavity, gating, surface)
     if caps is None:
-        caps = plan_caps(cast, max_pieces - 2)
+        caps = plan_caps(cast, max_pieces - 2, curved=curved)
     locked = locked_faces(cast, caps)
     layout = PieceLayout(
         caps=caps,
@@ -414,7 +466,7 @@ def plan_layout(
 
 
 def choose_main_direction(
-    mesh: trimesh.Trimesh, parting: PartingResult, max_pieces: int
+    mesh: trimesh.Trimesh, parting: PartingResult, max_pieces: int, *, curved: bool = True
 ) -> DirectionScore | None:
     """The two-piece candidate that leaves the least locked area once side pieces are added.
 
@@ -427,7 +479,9 @@ def choose_main_direction(
     for rank, score in enumerate(parting.candidates[:MAIN_CANDIDATES]):
         cavity = mesh.copy().apply_transform(mold_frame(mesh, score.direction, score.offset))
         cast = CastFaces(cavity, [])
-        caps = plan_caps(cast, max_pieces - 2, directions=QUICK_DIRECTIONS)
+        caps = plan_caps(
+            cast, max_pieces - 2, directions=QUICK_DIRECTIONS, quick=True, curved=curved
+        )
         locked = cast.locked_area(locked_faces(cast, caps))
         key = (round(locked, 3), len(caps), rank)
         logger.debug(
@@ -470,12 +524,25 @@ class _Option:
     None for a cap open on all sides but its cut plane."""
     avoid: list[float] = field(default_factory=list)
     """Positions along the direction of earlier parallel cut planes (see ``_parallel_planes``)."""
+    curved: bool = False
+    """Cut along the cast's far side instead of with a plane (see :func:`_build_curved`)."""
+    freed: np.ndarray | None = None
+    """For a curved option after an exact estimate: the locked faces the cap should take."""
 
 
 def plan_caps(
-    cast: CastFaces, max_caps: int, *, directions: int = CANDIDATE_DIRECTIONS
+    cast: CastFaces,
+    max_caps: int,
+    *,
+    directions: int = CANDIDATE_DIRECTIONS,
+    curved: bool = True,
+    quick: bool = False,
 ) -> list[Cap]:
-    """Greedily add the caps that release the most locked area, up to ``max_caps``."""
+    """Greedily add the caps that release the most locked area, up to ``max_caps``.
+
+    ``curved`` allows caps with curved cuts. ``quick`` fits those cuts on a
+    coarser grid, which is enough to compare layouts but not to build them.
+    """
     caps: list[Cap] = []
     locked = locked_faces(cast, caps)
     min_gain = MIN_GAIN_FRACTION * cast.total_area
@@ -503,6 +570,21 @@ def plan_caps(
                     option.bound, _ = _gain(cast, option, in_top, in_bottom, locked)
                     if option.bound >= min_gain:
                         options.append(option)
+        # Curved cuts are boxed in around one locked patch (an open one would take
+        # every bit of mold the cast shows along its pull) and tried along the axes
+        # and the patch's own axes, not every sampled direction: a cut along a
+        # hole's axis releases it with two pieces, where an oblique one that frees
+        # a little more at first leaves the rest harder to reach.
+        for patch in patches if curved else []:
+            for direction in _patch_directions(cast, patch[0]):
+                frame = _Frame(cast, direction)
+                for side in sides:
+                    if side * direction[2] < -NORMAL_EPS:
+                        continue
+                    option = _Option(0.0, frame, side, patch, curved=True)
+                    option.bound, _ = _gain(cast, option, in_top, in_bottom, locked)
+                    if option.bound >= min_gain:
+                        options.append(option)
         options.sort(key=lambda option: -option.bound)
         shortlist: list[tuple[float, Cap, _Option]] = []
         for option in options:
@@ -525,33 +607,56 @@ def plan_caps(
                     best.side,
                     best_option.patch,
                     _parallel_planes(caps, direction),
+                    best_option.curved,
                 )
                 gain, cap = _gain(cast, option, in_top, in_bottom, locked, exact=True)
                 if gain > best_gain:
                     best_gain, best = gain, cap
         # A cap can also lock faces in the paths of the pieces after it, so
-        # judge the shortlist by the locked area that is actually left.
+        # judge the shortlist by the locked area that is actually left, per piece.
         locked_area = cast.area[locked].sum()
-        true_gain, choice, choice_locked = 0.0, None, locked
-        for cap in [best, *(cap for _, cap, _ in shortlist[1:])]:
-            if _piece_volume(cast, caps, cap) < MIN_PIECE_FRACTION * cast.box_volume:
-                continue
+        true_gain, choice, choice_locked = 0.0, [], locked
+        for cap, option in [(best, best_option), *((c, o) for _, c, o in shortlist[1:])]:
+            if option.curved:
+                cap = _build_curved(
+                    cast, cap.direction, cap.side, cap.bounds, option.freed, quick=quick
+                )
+                if cap is None:
+                    continue
             after = locked_faces(cast, [*caps, cap])
             gain = locked_area - cast.area[after].sum()
+            big_enough: bool | None = None  # the size check is a boolean: only when needed
             if gain > true_gain:
-                true_gain, choice, choice_locked = gain, cap, after
-        if choice is None or true_gain < min_gain:
+                big_enough = _piece_volume(cast, caps, cap) >= MIN_PIECE_FRACTION * cast.box_volume
+                if big_enough:
+                    true_gain, choice, choice_locked = gain, [cap], after
+            if option.curved and len(caps) + 2 <= max_caps:
+                pair = _opposite(cast, caps, cap, option, after, quick)
+                if pair is None:
+                    continue
+                opposite, pair_after = pair
+                pair_gain = (locked_area - cast.area[pair_after].sum()) / 2.0
+                if pair_gain <= true_gain:
+                    continue
+                if big_enough is None:
+                    big_enough = (
+                        _piece_volume(cast, caps, cap) >= MIN_PIECE_FRACTION * cast.box_volume
+                    )
+                if big_enough:
+                    true_gain, choice, choice_locked = pair_gain, [cap, opposite], pair_after
+        if not choice or true_gain < min_gain:
             break
-        caps.append(choice)
+        caps.extend(choice)
         locked = choice_locked
-        logger.debug(
-            "cap %d along %s (side %d, %d side planes) releases %.1f mm^2",
-            len(caps),
-            np.round(choice.direction, 3),
-            choice.side,
-            len(choice.bounds),
-            true_gain,
-        )
+        for number, cap in enumerate(choice, start=len(caps) - len(choice) + 1):
+            logger.debug(
+                "cap %d along %s (side %d, %s cut) releases %.1f mm^2 per piece",
+                number,
+                np.round(cap.direction, 3),
+                cap.side,
+                "curved" if cap.cut is not None else "flat",
+                true_gain,
+            )
     return caps
 
 
@@ -604,7 +709,7 @@ def trim(solid: Manifold, halfspaces: list[Halfspace]) -> Manifold:
 
 def cap_region(cap: Cap, remaining: Manifold) -> Manifold:
     """The part of ``remaining`` that ``cap`` takes."""
-    return trim(remaining, cap.halfspaces())
+    return cap.region(remaining)
 
 
 def core_half(
@@ -617,7 +722,7 @@ def core_half(
     else:
         below = surface.below(float(block_bounds[0][2]) - surface.cell)
         region = block ^ below if sign < 0 else block - below
-    reach = [trim(block, cap.halfspaces()) for cap in caps if cap.side in (0, sign)]
+    reach = [cap.region(block) for cap in caps if cap.side in (0, sign)]
     if reach:
         region = region - Manifold.batch_boolean(reach, OpType.Add)
     return region
@@ -713,7 +818,24 @@ def _enters_core(
             valid = ends[:, j] > starts[:, j]
             gap |= valid & (starts[:, j] > reach + eps)
             reach = np.where(valid, np.maximum(reach, ends[:, j]), reach)
-    return (length > eps) & (gap | (reach < length - eps))
+    passed = (length > eps) & (gap | (reach < length - eps))
+    curved = [cap for cap in caps if cap.cut is not None and cap.side in (0, sign)]
+    if curved:
+        # A curved cap's planes only bound its reach; look along the segments that
+        # the bound covers for points outside every cap after all.
+        unsure = np.flatnonzero(~passed & (length > eps))
+        if len(unsure):
+            t = np.linspace(eps, 1.0, SWEEP_SAMPLES)[None, :] * length[unsure, None]
+            samples = points[unsure, None, :] - sign * t[..., None] * UP
+            flat = samples.reshape(-1, 3)
+            covered = np.zeros(len(flat), dtype=bool)
+            for cap in caps:
+                if cap.side in (0, sign):
+                    covered |= cap.contains(flat)
+            # ponytail: sampling can miss a gap thinner than the sample spacing; the
+            # removal check after building catches what this misses.
+            passed[unsure] = ~covered.reshape(len(unsure), -1).all(axis=1)
+    return passed
 
 
 def _patches(cast: CastFaces, locked: np.ndarray) -> list[np.ndarray]:
@@ -776,6 +898,19 @@ def _gain(
             reachable &= (high > lo + tol) & (low < hi - tol)
             inside_box &= (low >= lo - tol) & (high <= hi + tol)
     released = frame.normal_ok
+    if option.curved:
+        # A curved cut stops at the far side of the cast on every line along the pull,
+        # so there is no floor: the cap frees each locked face its direction releases.
+        freed = locked & _on_side(in_top, in_bottom, option.side) & inside_box & released
+        if option.side:
+            freed &= ~_on_side(in_top, in_bottom, -option.side)
+        if exact and freed.any():
+            freed &= releasable(cast.mesh, direction, faces=freed)
+        if not freed.any():
+            return 0.0, None
+        cap = Cap(direction=direction, offset=-np.inf, side=option.side, bounds=tuple(bounds))
+        option.freed = freed
+        return float(cast.area[freed].sum()), cap
     # The cap must release every face in its reach, owned by an earlier cap or not.
     floor = _highest(frame.high, reachable & ~released)
     if exact:
@@ -796,11 +931,97 @@ def _gain(
     return float(cast.area[freed].sum()), cap
 
 
+def _patch_directions(cast: CastFaces, faces: np.ndarray) -> np.ndarray:
+    """Pull directions worth a curved cut for a locked patch, both ways along each.
+
+    The six axes; the direction the patch's faces are most nearly parallel to
+    (a hole's axis); and the patch's average facing direction (out of a pocket).
+    """
+    normals = cast.normals[faces]
+    weights = cast.area[faces]
+    spread = (normals * weights[:, None]).T @ normals
+    axis = np.linalg.eigh(spread)[1][:, 0]
+    facing = (normals * weights[:, None]).sum(axis=0)
+    own = [axis]
+    if np.linalg.norm(facing) > 1e-9:
+        own.append(facing / np.linalg.norm(facing))
+    own = np.array(own)
+    return np.vstack([np.eye(3), -np.eye(3), own, -own])
+
+
+def _opposite(
+    cast: CastFaces, caps: list[Cap], cap: Cap, option: _Option, locked: np.ndarray, quick: bool
+) -> tuple[Cap, np.ndarray] | None:
+    """A curved cap pulled the opposite way around the same feature, taken after ``cap``.
+
+    A through-hole is best released by two caps meeting at its narrowest
+    point; neither would win on its own against a cap that frees a little of
+    two features at once. Returns the cap and the faces still locked after both.
+    """
+    direction = -cap.direction
+    if cap.side * direction[2] < -NORMAL_EPS:
+        return None
+    taken = [*caps, cap]
+    in_top, in_bottom = core_sides(cast, taken)
+    reverse = _Option(0.0, _Frame(cast, direction), cap.side, option.patch, [], curved=True)
+    _, spec = _gain(cast, reverse, in_top, in_bottom, locked, exact=True)
+    if spec is None:
+        return None
+    opposite = _build_curved(cast, direction, cap.side, spec.bounds, reverse.freed, quick=quick)
+    if opposite is None or _piece_volume(cast, taken, opposite) < (
+        MIN_PIECE_FRACTION * cast.box_volume
+    ):
+        return None
+    return opposite, locked_faces(cast, [*taken, opposite])
+
+
+def _build_curved(
+    cast: CastFaces,
+    direction: np.ndarray,
+    side: int,
+    bounds: tuple[Halfspace, ...],
+    freed: np.ndarray | None = None,
+    *,
+    quick: bool = False,
+) -> Cap | None:
+    """A cap whose cut runs along the cast's far side, or None if none can be made valid.
+
+    The cut is fitted, then raised over any face in the cap's reach that the
+    direction cannot release (a face beyond another layer of the cast) and
+    refitted, a few times over.
+    """
+    rows = plane_basis(direction)
+    scale = cast.mesh.scale
+    if bounds:
+        (a1, lo1), (_, neg_hi1), (a2, lo2), (_, neg_hi2) = bounds
+        corners = np.array([s1 * a1 + s2 * a2 for s1 in (lo1, -neg_hi1) for s2 in (lo2, -neg_hi2)])
+        margin = 0.0
+    else:
+        corners = trimesh.bounds.corners(cast.mesh.bounds)
+        margin = OPEN_CUT_MARGIN_FRACTION * scale
+    uv = corners @ rows[:2].T
+    uv_bounds = np.array([uv.min(axis=0) - margin, uv.max(axis=0) + margin])
+    released = cast.released(direction)
+    take = None if freed is None else cast.vertices[np.unique(cast.faces[freed])]
+    keep: np.ndarray | None = None
+    cell = CAP_CELL_FRACTION * scale * (QUICK_CELL_FACTOR if quick else 1.0)
+    for _ in range(CUT_RAISE_ROUNDS + 1):
+        cut = fit_cut(cast.mesh, rows, uv_bounds, cell, keep, take)
+        offset = float(cut.field.heights.min())
+        cap = Cap(direction=direction, offset=offset, side=side, bounds=bounds, cut=cut)
+        blocked = cast.side(side) & cast.cap_reaches(cap) & ~released & ~cast.internal
+        if not blocked.any():
+            return cap
+        points = cast.vertices[np.unique(cast.faces[blocked])]
+        keep = points if keep is None else np.vstack([keep, points])
+    return None
+
+
 def _piece_volume(cast: CastFaces, caps: list[Cap], cap: Cap) -> float:
     """Mold material ``cap`` would take within the cast's bounding box (a lower bound)."""
     box = block_solid(cast.mesh.bounds)
-    taken = [trim(box, earlier.halfspaces()) for earlier in caps]
-    region = trim(box, cap.halfspaces()) - cast.solid()
+    taken = [earlier.region(box) for earlier in caps]
+    region = cap.region(box) - cast.solid()
     if taken:
         region = region - Manifold.batch_boolean(taken, OpType.Add)
     return float(region.volume())
@@ -814,6 +1035,8 @@ def _parallel_planes(caps: list[Cap], direction: np.ndarray) -> list[float]:
     """
     planes = [0.0] if abs(direction[2]) >= PARALLEL_COS else []
     for cap in caps:
+        if cap.cut is not None:
+            continue  # a curved cut has no single plane to keep clear of
         alignment = float(cap.direction @ direction)
         if alignment >= PARALLEL_COS:
             planes.append(cap.offset)
