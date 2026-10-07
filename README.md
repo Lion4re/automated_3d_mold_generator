@@ -71,6 +71,7 @@ Common options for `make`:
 | `--pieces auto\|2\|4` | `auto` adds side pieces where needed; `2` and `4` force a fixed split | `auto` |
 | `--max-pieces N` | Most pieces `auto` may use (2-10) | `6` |
 | `--flat-parting` | Always split the halves with a flat plane | curved where it helps |
+| `--flat-side-pieces` | Always cut side pieces with flat planes (faster) | curved where it helps |
 | `--wall MM` | Wall thickness around the part | from part size |
 | `--sprue MM`, `--vent MM` | Channel diameters | from material |
 | `--keys N`, `--clearance MM` | Registration keys and their fit clearance | `4`, `0.2` |
@@ -131,7 +132,9 @@ result.save("molds/Rook")
    Vents are placed at local high points where air would be trapped.
 5. **Side pieces.** Where the two halves cannot release part of the surface
    (a side hole, the inside of a handle), side pieces are added. Each comes off
-   in its own straight direction before the halves. Every piece must release
+   in its own straight direction before the halves, and is cut either with a
+   flat plane or with a curved cut that follows the cast, whichever gives the
+   better mold. Every piece must release
    every part of the cast it can touch on its way out, and after building, each
    piece is slid out as an exact solid to confirm it does not catch. Areas that
    no piece can release are filled and reported. See
@@ -144,8 +147,9 @@ result.save("molds/Rook")
 
 ## Limitations
 
-- Side pieces are cut with flat planes; only the main parting surface curves.
-  Shapes that lock in every direction, such as a chain link or an arm wrapped
+- Parts that need side pieces take longer (roughly 20-70 s), because a layout
+  with curved side pieces is compared with one with flat side pieces.
+- Shapes that lock in every direction, such as a chain link or an arm wrapped
   around a body, cannot be released by any rigid mold. moldgen
   fills those spots and reports how much, so you can decide whether to use a
   flexible silicone mold instead.

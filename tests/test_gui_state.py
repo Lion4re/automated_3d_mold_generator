@@ -200,3 +200,13 @@ def test_summary_names_a_curved_parting_and_its_rise():
     info["layout"] = None
     html = st.summary_html(info)
     assert "+Z, flat plane" in html and "10.0 % of the surface" in html
+
+
+def test_side_piece_cut_setting_maps_to_the_config():
+    settings = st.MoldSettings()
+    assert st.label_for(st.SIDE_PIECE_CUT_OPTIONS, settings.side_piece_cuts) == (
+        "Curved where it helps"
+    )
+    settings.side_piece_cuts = st.SIDE_PIECE_CUT_OPTIONS["Flat (faster)"]
+    assert st.to_config(settings).side_piece_cuts == "flat"
+    assert st.MoldSettings.from_config(MoldConfig(side_piece_cuts="flat")).side_piece_cuts == "flat"
