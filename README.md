@@ -3,8 +3,9 @@
 Turn a 3D model into a casting mold you can 3D print.
 
 moldgen takes a mesh (STL, OBJ, PLY, OFF, 3MF, glTF/GLB), finds the direction in
-which a rigid mold releases the part best, places the parting plane, adds side
-pieces where the two halves alone would lock on the part, and builds
+which a rigid mold releases the part best, splits it along a flat or curved
+parting surface, adds side pieces where the two halves alone would lock on the
+part, and builds
 print-ready mold pieces with a pour sprue and funnel, air vents and
 registration keys. Defaults (sprue and vent size, shrinkage compensation,
 release agent, print-material temperature limits) come from presets for common
@@ -69,6 +70,7 @@ Common options for `make`:
 | `--parting-offset MM` | Parting plane position along the direction | least undercut |
 | `--pieces auto\|2\|4` | `auto` adds side pieces where needed; `2` and `4` force a fixed split | `auto` |
 | `--max-pieces N` | Most pieces `auto` may use (2-10) | `6` |
+| `--flat-parting` | Always split the halves with a flat plane | curved where it helps |
 | `--wall MM` | Wall thickness around the part | from part size |
 | `--sprue MM`, `--vent MM` | Channel diameters | from material |
 | `--keys N`, `--clearance MM` | Registration keys and their fit clearance | `4`, `0.2` |
@@ -117,7 +119,10 @@ result.save("molds/Rook")
    a sampled hemisphere, refined locally) are scored by the surface area that
    cannot be released by either half, using an occlusion-aware ray test rather
    than face normals alone, then by area with too little draft. The parting plane
-   is placed where the fewest faces are trapped.
+   is placed where the fewest faces are trapped. Where a flat plane would still
+   trap part of the model, the halves are split along a curved surface that
+   follows the part's outline instead
+   ([docs/curved-parting-design.md](docs/curved-parting-design.md)).
 3. **Mold block.** The block is aligned with the minimum-area rectangle around
    the part, so it uses as little filament as possible. The cavity is enlarged to
    compensate for the material's shrinkage.
@@ -139,8 +144,9 @@ result.save("molds/Rook")
 
 ## Limitations
 
-- Cuts are flat. Shapes that lock in every direction, such as a chain link or
-  an arm wrapped around a body, cannot be released by any rigid mold. moldgen
+- Side pieces are cut with flat planes; only the main parting surface curves.
+  Shapes that lock in every direction, such as a chain link or an arm wrapped
+  around a body, cannot be released by any rigid mold. moldgen
   fills those spots and reports how much, so you can decide whether to use a
   flexible silicone mold instead.
 - Draft is analysed and reported, not added to the part.

@@ -5,6 +5,7 @@ import trimesh
 from moldgen.config import ConfigError, MoldConfig
 from moldgen.gui import state as st
 from moldgen.parting import FACE_LOW_DRAFT, FACE_OK, FACE_UNDERCUT, analyze_parting
+from moldgen.surface import PartingSurface
 
 
 def test_default_settings_map_back_to_the_default_config():
@@ -133,3 +134,58 @@ def test_text_is_escaped_and_incompatible_materials_are_flagged():
     assert "softens" in st.material_html("pewter", "pla")
     assert "softens" not in st.material_html("resin", "pla")
     assert st.download_name("../my part!") == "my_part_mold.zip"
+
+
+def test_parting_surface_setting_maps_to_the_config():
+    settings = st.MoldSettings.from_config()
+    assert st.label_for(st.PARTING_SURFACE_OPTIONS, settings.parting_surface) == (
+        "Curved where needed"
+    )
+    settings.parting_surface = st.PARTING_SURFACE_OPTIONS["Flat"]
+    assert st.to_config(settings).parting_surface == "flat"
+    assert st.MoldSettings.from_config(MoldConfig(parting_surface="flat")).parting_surface == "flat"
+
+
+def test_surface_mesh_follows_the_surface_inside_the_block(rng):
+    heights = rng.normal(size=(9, 7))
+    surface = PartingSurface(origin=np.array([-1.0, -2.0]), cell=1.0, heights=heights)
+    block = np.array([[-0.5, -1.25, -5.0], [5.6, 2.3, 5.0]])
+
+    vertices, faces = st.surface_mesh(surface, block)
+
+    assert vertices[:, :2].min(axis=0) == pytest.approx(block[0, :2], abs=1e-5)
+    assert vertices[:, :2].max(axis=0) == pytest.approx(block[1, :2], abs=1e-5)
+    # Every point of every triangle lies on the surface, so the grid is split on the same
+    # diagonal as PartingSurface.height and the clipping adds no new bends.
+    corners = vertices[faces]
+    weights = rng.dirichlet(np.ones(3), size=len(faces))
+    points = np.einsum("fk,fkd->fd", weights, corners)
+    assert points[:, 2] == pytest.approx(surface.height(points[:, :2]), abs=1e-5)
+    area = trimesh.triangles.area(corners).sum()
+    assert area >= np.prod(block[1, :2] - block[0, :2]) - 1e-3
+
+
+def test_summary_names_a_curved_parting_and_its_rise():
+    info = {
+        "mold": {
+            "outer_size_mm": [10, 10, 10],
+            "wall_thickness_mm": 5.0,
+            "sprue_diameter_mm": 6.0,
+            "funnel": False,
+            "vents": 0,
+            "keys": 4,
+            "key_clearance_mm": 0.25,
+        },
+        "parting": {
+            "direction_label": "+Z",
+            "undercut_fraction": 0.1,
+            "surface": "curved",
+            "surface_rise_mm": 4.24,
+        },
+        "material": {"cast_volume_cm3": 1.0},
+        "pieces": [],
+        "layout": None,
+    }
+    assert "+Z, curved (up to 4.2 mm from flat)" in st.summary_html(info)
+    info["parting"].update(surface="flat", surface_rise_mm=0.0)
+    assert "+Z, 10.0 % undercut" in st.summary_html(info)
