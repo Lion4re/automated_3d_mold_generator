@@ -33,6 +33,15 @@ def test_manual_values_override_the_automatic_ones(sphere):
     assert config.parting_offset == pytest.approx(2.0)
 
 
+def test_automatic_pieces_are_the_default_and_carry_the_maximum():
+    settings = st.MoldSettings.from_config()
+    assert next(iter(st.PIECE_OPTIONS)) == st.AUTO_PIECES
+    assert settings.pieces == st.PIECE_OPTIONS[st.AUTO_PIECES] == "auto"
+    settings.max_pieces = 8
+    config = st.to_config(settings)
+    assert (config.pieces, config.max_pieces) == ("auto", 8)
+
+
 def test_invalid_settings_raise_config_error():
     settings = st.MoldSettings.from_config()
     settings.shrinkage_override = True
@@ -93,6 +102,30 @@ def test_halves_explode_along_the_parting_direction():
     bottom = np.array([[-10.0, -10.0, -10.0], [10.0, 10.0, 0.0]])
     dirs = st.explode_directions([top, bottom], block)
     assert dirs == pytest.approx(np.array([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]]))
+
+
+def test_face_regions_map_to_pieces_in_removal_order():
+    # Regions: side_1, side_2, top, bottom; -1 is filled.
+    regions = np.array([0, 1, 2, 3, -1])
+    names = ["side_1", "side_2", "top", "bottom"]
+    assert st.face_pieces(regions, 2, True, names).tolist() == [0, 1, 2, 3, st.FILLED]
+    # Without a top piece its region belongs to the bottom, which is now third.
+    merged = st.face_pieces(regions, 2, False, ["side_1", "side_2", "bottom"])
+    assert merged.tolist() == [0, 1, 2, 2, st.FILLED]
+
+
+def test_legend_lists_each_piece_with_its_pull_and_colour_then_the_filling():
+    pieces = [{"name": "side_1", "pull_label": "+Y"}, {"name": "top", "pull_label": "+Z"}]
+    layout = {"locked_fraction": 0.021, "filled_volume_cm3": 0.4}
+    rows = st.legend_rows({"pieces": pieces, "layout": layout})
+    assert rows == [
+        ("side_1", "+Y", st.PIECE_COLORS[0]),
+        ("top", "+Z", st.PIECE_COLORS[1]),
+        ("filled", "2.1 %", st.FILLED_COLOR),
+    ]
+    assert len(set(st.PIECE_COLORS)) == 10
+    assert st.FILLED_COLOR not in st.PIECE_COLORS
+    assert len(st.legend_rows({"pieces": pieces, "layout": None})) == 2
 
 
 def test_text_is_escaped_and_incompatible_materials_are_flagged():

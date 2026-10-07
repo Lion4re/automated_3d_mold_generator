@@ -58,7 +58,7 @@ _DEFAULTS = MoldConfig()
 # Choice types are built from the presets so new presets appear automatically.
 MaterialKey = Enum("MaterialKey", {key: key for key in MATERIALS}, type=str)
 PrintMaterialKey = Enum("PrintMaterialKey", {key: key for key in PRINT_MATERIALS}, type=str)
-Pieces = Literal[2, 4]
+Pieces = Literal["auto", "2", "4"]
 
 _DEFAULT_MATERIAL = MaterialKey(_DEFAULTS.material)
 _DEFAULT_PRINT_MATERIAL = PrintMaterialKey(_DEFAULTS.print_material)
@@ -329,7 +329,8 @@ def _build_config(
     scale: float = _DEFAULTS.scale,
     direction: str = "auto",
     parting_offset: float | None = None,
-    pieces: int = _DEFAULTS.pieces,
+    pieces: int | str = _DEFAULTS.pieces,
+    max_pieces: int = _DEFAULTS.max_pieces,
     wall: float | None = None,
     shrinkage_percent: float | None = None,
     sprue: float | None = None,
@@ -350,7 +351,8 @@ def _build_config(
         scale=scale,
         direction=_parse_direction(direction),
         parting_offset=parting_offset,
-        pieces=pieces,
+        pieces=int(pieces) if str(pieces).isdigit() else pieces,
+        max_pieces=max_pieces,
         wall_thickness=wall,
         shrinkage=None if shrinkage_percent is None else shrinkage_percent / 100.0,
         sprue_diameter=sprue,
@@ -537,11 +539,16 @@ def _print_mold(ui: Ui, outcome: _Outcome, *, batch: bool) -> None:
     details = _details_table()
     details.add_row("Mold size", _size(mold["outer_size_mm"]))
     details.add_row("Wall thickness", f"{mold['wall_thickness_mm']:.1f} mm")
-    details.add_row(
-        "Parting",
-        f"{parting['direction_label']}, plane at {_mm(parting['offset_mm'])}, "
-        f"{parting['undercut_fraction']:.1%} undercut",
-    )
+    plane = f"{parting['direction_label']}, plane at {_mm(parting['offset_mm'])}"
+    layout = info["layout"]
+    if layout and layout["side_pieces"]:
+        details.add_row("Parting", plane)
+        released = f"{layout['side_pieces']}, removed first in the order listed above"
+        if layout["filled_volume_cm3"] > 0:
+            released += f"; {layout['locked_fraction']:.1%} of the surface filled"
+        details.add_row("Side pieces", released)
+    else:
+        details.add_row("Parting", f"{plane}, {parting['undercut_fraction']:.1%} undercut")
     details.add_row("Pouring", pouring)
     details.add_row("Keys", keys)
     details.add_row("Cast volume", f"{info['material']['cast_volume_cm3']:.1f} cm³ plus sprue")
@@ -812,7 +819,7 @@ def _guided(ui: Ui) -> int:
     console.print()
     model = _ask_model(console)
     material = _ask_material(console)
-    pieces = int(Prompt.ask("Pieces", console=console, choices=["2", "4"], default="2"))
+    pieces = Prompt.ask("Pieces", console=console, choices=["auto", "2", "4"], default="auto")
     config = _build_config(material=material, pieces=pieces)
     out_dir = DEFAULT_OUT / model.stem
 
@@ -833,7 +840,7 @@ def _guided(ui: Ui) -> int:
         "--material",
         material,
         "--pieces",
-        str(pieces),
+        pieces,
     ]
     if force:
         command.append("--force")
@@ -914,9 +921,16 @@ def make(
     pieces: Annotated[
         Pieces,
         _option(
-            "--pieces", help="2 for a two-part mold, 4 to split each half again.", panel=_PARTING
+            "--pieces",
+            help="auto adds side pieces where the two halves cannot release the part; "
+            "2 for a two-part mold; 4 to split each half again.",
+            panel=_PARTING,
         ),
-    ] = 2,
+    ] = str(_DEFAULTS.pieces),
+    max_pieces: Annotated[
+        int,
+        _option("--max-pieces", help="Most pieces --pieces auto may use (2-10).", panel=_PARTING),
+    ] = _DEFAULTS.max_pieces,
     wall: Annotated[
         float | None,
         _option(
@@ -990,6 +1004,7 @@ def make(
             direction=direction,
             parting_offset=parting_offset,
             pieces=pieces,
+            max_pieces=max_pieces,
             wall=wall,
             shrinkage_percent=shrinkage,
             sprue=sprue,
