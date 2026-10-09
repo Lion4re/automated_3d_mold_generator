@@ -479,6 +479,16 @@ def column_spans(mesh: trimesh.Trimesh, xy: np.ndarray) -> tuple[np.ndarray, np.
     return low, high
 
 
+def points_inside(mesh: trimesh.Trimesh, points: np.ndarray) -> np.ndarray:
+    """Whether each point lies inside the closed ``mesh``: a ray up from it crosses it oddly often."""
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    crossings = np.zeros(len(points), dtype=np.int64)
+    tris = mesh.triangles[np.abs(mesh.face_normals[:, 2]) > FACING_EPS]
+    for q, height in _column_heights(tris, _barycentric_planes(tris), points, above_only=True):
+        np.add.at(crossings, q[height > points[q, 2]], 1)
+    return crossings % 2 == 1
+
+
 def _column_heights(
     tris: np.ndarray, planes: np.ndarray, points: np.ndarray, *, above_only: bool
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:

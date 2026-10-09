@@ -338,7 +338,7 @@ class MoldGui:
             self.orient = gui.add_checkbox(
                 "Orient pieces",
                 d.orient_for_print,
-                hint="Exported pieces lie with the parting face up, so no supports are needed.",
+                hint="Exported pieces lie the way they print with the least support.",
             )
 
         self.generate = gui.add_button("Generate mold", disabled=True)

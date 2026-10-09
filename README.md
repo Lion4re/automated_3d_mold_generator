@@ -34,7 +34,7 @@ moldgen make models/Pawn.stl
 ```
 
 This writes `molds/Pawn/` with the mold pieces as STL files (already oriented
-for printing, parting face up), `INSTRUCTIONS.txt` with print, assembly, pouring
+so they print with the least support), `INSTRUCTIONS.txt` with print, assembly, pouring
 and demolding notes, and `report.json` with every value that was used.
 
 Inspect a model before committing to a print:
@@ -66,6 +66,7 @@ Common options for `make`:
 |---|---|---|
 | `-m, --material KEY` | Casting material preset (`moldgen materials`) | `resin` |
 | `-p, --print-material KEY` | Material the mold is printed in | `pla` |
+| `--bed WxDxH` | Printer build volume in mm; pieces are checked against it | `220x220x250` |
 | `-d, --direction AXIS` | Demolding direction: `auto`, `x`, `-z`, ... or a vector such as `0,1,1` | `auto` |
 | `--parting-offset MM` | Parting plane position along the direction | least undercut |
 | `--pieces auto\|2\|4` | `auto` adds side pieces where needed; `2` and `4` force a fixed split | `auto` |
@@ -143,7 +144,12 @@ result.save("molds/Rook")
    parting face and on the cut faces of side pieces, clear of the cavity and the
    channels.
 7. **Pieces.** All booleans run on [manifold3d](https://github.com/elalish/manifold),
-   so every piece is a closed solid. Each piece is laid flat for printing.
+   so every piece is a closed solid. Each piece is laid out the way it prints
+   with the least support.
+8. **Print checks.** Without printing anything, each piece is checked against
+   the printer's bed (`--bed 220x220x250`), for overhangs that need supports,
+   for walls thinner than the printer makes solid and for fragile pieces. The
+   result is in the warnings, `report.json` and the GUI's piece table.
 
 ## Limitations
 
@@ -173,6 +179,10 @@ pip install -e ".[dev,repair]"
 python -m pytest            # add -m "not slow" to skip the full-pipeline runs
 ruff check src tests && ruff format --check src tests
 ```
+
+`scripts/benchmark.py MODELS_DIR --out results.json` molds every model in a
+folder and tabulates pieces, locked and filled area, catches, keys, warnings and
+time, to compare a change across many shapes.
 
 ## Background
 

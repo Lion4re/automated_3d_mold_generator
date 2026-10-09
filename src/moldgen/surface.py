@@ -55,8 +55,9 @@ OVER_RELAXATION = 1.8
 COARSEST_NODES = 12
 """Grid levels are halved until one side has about this many nodes."""
 
-KEY_MAX_SLOPE = 0.08
-"""Steepest surface (rise over run) on which registration keys are placed."""
+KEY_MAX_SLOPE = 0.35
+"""Steepest surface (rise over run) on which registration keys are placed; keys there
+stand on a post (see :func:`moldgen.pipeline._stand_on`)."""
 
 CUT_RELAX_ITERATIONS = 80
 """Relaxation sweeps per level for a side piece's cut, which is fixed on most of its grid."""

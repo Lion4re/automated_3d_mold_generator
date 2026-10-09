@@ -22,6 +22,7 @@ from moldgen.config import MAX_AUTO_PIECES, MIN_AUTO_PIECES, MoldConfig
 from moldgen.materials import MATERIALS, PRINT_MATERIALS, compatibility_warnings
 from moldgen.meshio import SUPPORTED_SUFFIXES
 from moldgen.parting import FACE_LOW_DRAFT, FACE_OK, FACE_UNDERCUT
+from moldgen.printcheck import OVERHANG_WARN_MM2, THIN_WARN_MM2
 
 if TYPE_CHECKING:
     from moldgen.parting import PartingResult
@@ -741,11 +742,12 @@ def summary_html(info: Mapping[str, Any]) -> str:
             )
         )
     table = [
-        '<div style="display:grid;grid-template-columns:1fr auto auto;column-gap:0.75em;'
+        '<div style="display:grid;grid-template-columns:1fr auto auto auto;column-gap:0.75em;'
         f'row-gap:0.15em;margin-top:0.6em;{NUMERIC}">',
         f'<span style="{DIMMED}">Piece</span>',
         f'<span style="{DIMMED}">Print size (mm)</span>',
         f'<span style="{DIMMED};text-align:right">Mass</span>',
+        f'<span style="{DIMMED}">Print</span>',
     ]
     for piece in info["pieces"]:
         size = " x ".join(f"{v:.0f}" for v in piece["print_size_mm"])
@@ -753,10 +755,28 @@ def summary_html(info: Mapping[str, Any]) -> str:
             f"<span>{_esc(piece['name'])}</span>",
             f"<span>{size}</span>",
             f'<span style="text-align:right">{piece["approx_mass_g"]:.0f} g</span>',
+            f"<span>{_esc(print_status(piece.get('print_check')))}</span>",
         ]
     table.append("</div>")
     block = info_html(rows)
     return block[: -len("</div>")] + "".join(table) + "</div>"
+
+
+def print_status(check: Mapping[str, Any] | None) -> str:
+    """Short verdict of one piece's print check for the piece table ("ok" or its problems)."""
+    if not check:
+        return ""
+    problems = [
+        label
+        for label, bad in (
+            ("too big", not check["fits_bed"]),
+            ("supports", check["overhang_mm2"] > OVERHANG_WARN_MM2),
+            ("thin edges", check["thin_wall_mm2"] > THIN_WARN_MM2),
+            ("fragile", check["fragile"]),
+        )
+        if bad
+    ]
+    return ", ".join(problems) or "ok"
 
 
 def warnings_html(warnings: Sequence[str]) -> str:
