@@ -517,9 +517,7 @@ def choose_main_direction(
 
     Ties go to fewer side pieces, then to the better two-piece score. Returns
     the candidate (None when the chosen two-piece direction already releases
-    the part) and the share of the surface it leaves locked, as estimated. The
-    search stops at the first candidate if that leaves ``RIGID_LIMIT_LOCKED``
-    locked: side pieces cannot release such a part, and searching is slow.
+    the part) and the share of the surface it leaves locked, as estimated.
     """
     if not parting.candidates or parting.undercut_fraction == 0.0:
         return None, 0.0
@@ -542,8 +540,6 @@ def choose_main_direction(
             best_key, best = key, score
         if locked <= GOOD_ENOUGH_LOCKED and len(caps) <= 2:
             break  # the best two-piece direction already works with few side pieces
-        if locked >= RIGID_LIMIT_LOCKED:
-            break
     return best, best_key[0]
 
 

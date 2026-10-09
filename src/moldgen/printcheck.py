@@ -32,7 +32,7 @@ MIN_CONTACT_SHARE = 0.15
 """A piece resting on less than this share of its footprint may tip or come loose."""
 
 THICKNESS_SAMPLES = 4000
-"""Faces sampled (by area) to measure wall thickness."""
+"""Faces measured for wall thickness; larger meshes are sampled by area."""
 
 WALL_COS = 0.5
 """The far side of a wall faces back within 60 degrees of the near side."""
@@ -133,9 +133,14 @@ def _thin_walls(mesh: trimesh.Trimesh, min_wall: float) -> tuple[float, float]:
     total = float(areas.sum())
     if total == 0:
         return 0.0, float("inf")
-    count = min(THICKNESS_SAMPLES, len(mesh.faces))
-    rng = np.random.default_rng(0)
-    faces = rng.choice(len(mesh.faces), size=count, replace=False, p=areas / total)
+    sampled = len(mesh.faces) > THICKNESS_SAMPLES
+    if sampled:
+        # Drawn in proportion to area, so each draw stands for the same share of it.
+        rng = np.random.default_rng(0)
+        faces = rng.choice(len(mesh.faces), size=THICKNESS_SAMPLES, p=areas / total)
+    else:
+        faces = np.arange(len(mesh.faces))
+    count = len(faces)
     normals = mesh.face_normals[faces]
     origins = mesh.triangles_center[faces] - 1e-4 * normals
     hits, rays, hit_faces = mesh.ray.intersects_location(origins, -normals, multiple_hits=False)
@@ -146,9 +151,8 @@ def _thin_walls(mesh: trimesh.Trimesh, min_wall: float) -> tuple[float, float]:
     facing_back = np.einsum("ij,ij->i", mesh.face_normals[hit_faces], normals[rays]) < -WALL_COS
     thickness[rays[facing_back]] = distance[facing_back]
     thin = thickness < min_wall
-    sampled = areas[faces]
-    # Scale the thin share of the sampled area up to the whole surface.
-    return float(sampled[thin].sum() / sampled.sum() * total), float(thickness.min())
+    thin_area = float(thin.mean() * total) if sampled else float(areas[thin].sum())
+    return thin_area, float(thickness.min())
 
 
 def best_print_up(mesh: trimesh.Trimesh, preferred: np.ndarray) -> np.ndarray:

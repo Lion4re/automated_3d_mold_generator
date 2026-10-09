@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import trimesh
 
 from moldgen.parting import points_inside
@@ -42,6 +43,29 @@ def test_piece_on_an_edge_is_turned_onto_a_face():
     up = best_print_up(wedge, edge_down)
 
     assert not np.allclose(up, edge_down)
+
+
+def test_ray_through_a_shared_edge_counts_one_crossing():
+    box = trimesh.creation.box([10.0, 10.0, 10.0])  # the centre's ray meets the top diagonal
+
+    assert points_inside(box, np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 6.0]])).tolist() == [
+        True,
+        False,
+    ]
+
+
+def test_thin_area_does_not_depend_on_tessellation():
+    plate = trimesh.creation.box(bounds=[[0, 0, 0], [80, 80, 0.6]])
+    # Small triangles on the thin faces, large ones on the thick edges, and more
+    # faces than are measured, so the thin area is estimated from a sample.
+    fine = plate
+    for _ in range(6):
+        fine = fine.subdivide(np.flatnonzero(np.abs(fine.face_normals[:, 2]) > 0.9))
+
+    coarse_check = check_piece("plate", plate, BED, MIN_WALL_FDM_MM)
+    fine_check = check_piece("plate", fine, BED, MIN_WALL_FDM_MM)
+
+    assert fine_check.thin_mm2 == pytest.approx(coarse_check.thin_mm2, rel=0.02)
 
 
 def test_points_inside_matches_trimesh(sphere, rng):
