@@ -67,8 +67,12 @@ surface can release; side pieces or filling handle it.
   `height()` interpolates on. Filling extrudes locked faces down (or up) to the
   surface.
 - **Keys.** Registration keys go on parts of the surface that slope less than
-  about 4.5 degrees, away from the cast and the side pieces. Each key stands
-  at the surface's height where it is placed.
+  about 19 degrees (rise over run 0.35), away from the cast and the side
+  pieces. Each key's cone starts at the highest point of the surface under it,
+  so it stands out by its full height all round, on a straight post that
+  reaches below the lowest point, so it is anchored all round
+  (`pipeline._stand_on`). The post is clipped to mold material. The same
+  applies to keys on the curved cuts of side pieces.
 - **Removal check.** The safety net that slides every finished piece out
   covers curved halves too.
 

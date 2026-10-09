@@ -87,11 +87,19 @@ def repair_mesh(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh, RepairReport]:
     _remove_unreferenced_vertices(work, actions)
     if _is_clean_solid(work):
         reference_volume = None
+        # Debris can share an edge with a neighbouring body (manifold3d accepts
+        # such meshes); taking it away would break the neighbour, so undo it then.
+        kept = work.copy()
+        kept_actions = len(actions)
         _remove_debris(work, actions)
+        if not _is_clean_solid(work):
+            work = kept
+            del actions[kept_actions:]
     else:
         reference_volume = _measurable_volume(work)
         _merge_duplicate_vertices(work, actions)
         _remove_bad_faces(work, actions)
+        work = _separate_at_shared_edges(work, actions)
         _remove_debris(work, actions)
         _fix_winding(work, actions)
         if not work.is_watertight:
@@ -176,6 +184,34 @@ def _remove_bad_faces(work: trimesh.Trimesh, actions: list[str]) -> None:
         changed = True
     if changed:
         work.remove_unreferenced_vertices()
+
+
+def _separate_at_shared_edges(work: trimesh.Trimesh, actions: list[str]) -> trimesh.Trimesh:
+    """Give bodies that touch along an edge their own copies of that edge.
+
+    Separate closed bodies that touch (gear teeth, assembled parts) end up
+    sharing edges once coincident vertices are merged, and an edge used by
+    more than two faces is not a valid solid. Splitting the faces into groups
+    connected only through ordinary two-face edges gives each body back its
+    own vertices; overlapping bodies are united again at the end.
+    """
+    groups = trimesh.grouping.group_rows(work.edges_sorted)
+    if all(len(group) <= 2 for group in groups):
+        return work
+    pairs = np.array([group for group in groups if len(group) == 2], dtype=np.int64)
+    n = len(work.faces)
+    faces_of = pairs // 3 if len(pairs) else np.zeros((0, 2), dtype=np.int64)
+    graph = coo_matrix(
+        (np.ones(len(faces_of), dtype=np.int8), (faces_of[:, 0], faces_of[:, 1])), (n, n)
+    )
+    count, labels = connected_components(graph, directed=False)
+    shared = sum(len(group) > 2 for group in groups)
+    bodies = [work.submesh([np.flatnonzero(labels == i)], append=True) for i in range(count)]
+    actions.append(
+        f"separated {_count(count, 'body', 'bodies')} that shared "
+        f"{_count(shared, 'edge')} with each other"
+    )
+    return trimesh.util.concatenate(bodies)
 
 
 def _remove_debris(work: trimesh.Trimesh, actions: list[str]) -> None:

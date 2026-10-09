@@ -479,6 +479,24 @@ def column_spans(mesh: trimesh.Trimesh, xy: np.ndarray) -> tuple[np.ndarray, np.
     return low, high
 
 
+def points_inside(mesh: trimesh.Trimesh, points: np.ndarray) -> np.ndarray:
+    """Whether each point lies inside the closed ``mesh``: a ray up from it crosses it oddly often."""
+    points = np.asarray(points, dtype=float).reshape(-1, 3)
+    tris = mesh.triangles[np.abs(mesh.face_normals[:, 2]) > FACING_EPS]
+    hits = [
+        np.column_stack([q, height])[height > points[q, 2]]
+        for q, height in _column_heights(tris, _barycentric_planes(tris), points, above_only=True)
+    ]
+    if not hits:
+        return np.zeros(len(points), dtype=bool)
+    hits = np.concatenate(hits)
+    # A ray through an edge or vertex hits every triangle there at the same height:
+    # that is one crossing.
+    hits[:, 1] = np.round(hits[:, 1], 6)
+    crossed = np.unique(hits, axis=0)[:, 0].astype(np.int64)
+    return np.bincount(crossed, minlength=len(points)) % 2 == 1
+
+
 def _column_heights(
     tris: np.ndarray, planes: np.ndarray, points: np.ndarray, *, above_only: bool
 ) -> Iterator[tuple[np.ndarray, np.ndarray]]:

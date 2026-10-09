@@ -338,7 +338,7 @@ class MoldGui:
             self.orient = gui.add_checkbox(
                 "Orient pieces",
                 d.orient_for_print,
-                hint="Exported pieces lie with the parting face up, so no supports are needed.",
+                hint="Exported pieces lie the way they print with the least support.",
             )
 
         self.generate = gui.add_button("Generate mold", disabled=True)
@@ -837,11 +837,18 @@ class MoldGui:
     def _generate_job(self, settings: st.MoldSettings, rev: tuple[int, int]) -> None:
         try:
             with self._lock:
-                part, parting = self._part, self._parting
+                part, parting, analysis = self._part, self._parting, self._analysis
                 current = (self._model_rev, self._parting_rev)
             if part is None or parting is None:
                 raise MoldError("Load a model and wait for the parting analysis first.")
-            config = st.to_config(settings, parting)
+            # The automatic plane, untouched, leaves the choice of pull to the pipeline,
+            # which may pick another candidate when side pieces work better along it.
+            automatic = (
+                analysis is not None
+                and np.allclose(parting.direction, analysis.direction)
+                and np.isclose(parting.offset, analysis.offset)
+            )
+            config = st.to_config(settings, None if automatic else parting)
 
             def progress(stage: str, fraction: float) -> None:
                 self.progress.value = float(np.clip(100.0 * fraction, 0.0, 100.0))

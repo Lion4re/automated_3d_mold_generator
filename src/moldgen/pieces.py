@@ -19,6 +19,7 @@ top and bottom halves it is everything above or below their region.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 
@@ -35,6 +36,7 @@ from moldgen.parting import (
     DirectionScore,
     PartingResult,
     mold_frame,
+    points_inside,
     ray_hit_distances,
     releasable,
     release_tolerance_for,
@@ -63,6 +65,14 @@ MIN_GAIN_FRACTION = 5e-4
 MIN_PIECE_FRACTION = 0.005
 """Side pieces smaller than this share of the part's bounding box are not worth printing;
 the spot they would release is filled instead."""
+
+GOOD_ENOUGH_LOCKED = 0.002
+"""A layout leaving at most this share locked ends the search for a better main pull or
+pour side."""
+
+RIGID_LIMIT_LOCKED = 0.4
+"""A part leaving this share of its surface locked even with side pieces (parts that
+interlock or wrap around each other) cannot come out of a rigid mold."""
 
 SHORTLIST = 3
 """Caps compared by the locked area they really leave, after the fast estimate."""
@@ -116,6 +126,12 @@ QUICK_CELL_FACTOR = 2.5
 OPEN_CUT_MARGIN_FRACTION = 0.35
 """How far (times the cast size) an open curved cut's grid reaches past the cast, so it
 covers the whole mold block."""
+
+SNAP_TO_BLOCK_MM = 3.0
+"""A side plane closer than this to the block's outside is moved out to it."""
+
+CAST_CACHE_SIZE = 12
+"""Cast analyses kept for reuse (see :meth:`CastFaces.of`)."""
 
 SIDES = (0, 1, -1)
 """Cap extents: the whole remaining block, its top half, its bottom half."""
@@ -189,6 +205,10 @@ class PieceLayout:
 class CastFaces:
     """The cast surface used for the analysis, subdivided to a maximum edge length.
 
+    Build it with :meth:`of`, which reuses an earlier analysis of the same cast:
+    layouts are compared many times over (main pulls, pour sides, curved and
+    flat cuts), and the release tests it caches are the expensive part.
+
     Faces of one solid that lie inside another (where the sprue meets the
     cavity) are not part of the cast's surface; they still block rays but
     carry no release requirement.
@@ -230,7 +250,7 @@ class CastFaces:
                     (solid_of_face == i) & np.all((centres >= lo) & (centres <= hi), axis=1)
                 )
                 if len(near):
-                    self.internal[near] |= other.contains(centres[near])
+                    self.internal[near] |= points_inside(other, centres[near])
         self.box_volume = float(np.prod(self.mesh.extents))
         self.area = np.where(self.internal, 0.0, self.mesh.area_faces)
         self.total_area = float(self.area.sum())
@@ -253,6 +273,27 @@ class CastFaces:
         self._solid: Manifold | None = None
         self._released: dict[tuple[float, ...], np.ndarray] = {}
         self._vertical: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+
+    @classmethod
+    def of(
+        cls,
+        cavity: trimesh.Trimesh,
+        gating: list[trimesh.Trimesh],
+        surface: PartingSurface | None = None,
+    ) -> CastFaces:
+        """The analysis of this cast, from the cache when the same cast was analysed before."""
+        digest = hashlib.blake2b(digest_size=16)
+        for mesh in (cavity, *gating):
+            digest.update(np.ascontiguousarray(mesh.vertices, dtype=np.float64).tobytes())
+            digest.update(np.ascontiguousarray(mesh.faces, dtype=np.int64).tobytes())
+        if surface is not None and not surface.flat:
+            digest.update(np.ascontiguousarray(surface.heights).tobytes())
+        key = digest.hexdigest()
+        if key not in _CAST_CACHE:
+            if len(_CAST_CACHE) >= CAST_CACHE_SIZE:
+                _CAST_CACHE.pop(next(iter(_CAST_CACHE)))
+            _CAST_CACHE[key] = cls(cavity, gating, surface)
+        return _CAST_CACHE[key]
 
     def vertical_reach(self, sign: int) -> tuple[np.ndarray, np.ndarray]:
         """Points just outside each face, and how far each can move towards z == 0.
@@ -378,6 +419,9 @@ def _refine_across(
     return vertices, faces, source
 
 
+_CAST_CACHE: dict[str, CastFaces] = {}
+
+
 def core_sides(cast: CastFaces, caps: list[Cap]) -> tuple[np.ndarray, np.ndarray]:
     """Faces that still touch the top and the bottom half after the caps are taken."""
     in_top, in_bottom = cast.top.copy(), cast.bottom.copy()
@@ -442,9 +486,10 @@ def plan_layout(
     ``caps`` skips the search when the caps are already known. Areas no piece
     can release are filled; the returned cavity then differs from ``cavity``.
     """
-    cast = CastFaces(cavity, gating, surface)
+    cast = CastFaces.of(cavity, gating, surface)
     if caps is None:
         caps = plan_caps(cast, max_pieces - 2, curved=curved)
+    caps = [_snap_to_block(cap, block_bounds, cast.mesh.vertices) for cap in caps]
     locked = locked_faces(cast, caps)
     layout = PieceLayout(
         caps=caps,
@@ -457,7 +502,7 @@ def plan_layout(
         cut, layout.filled_volume = fill_locked(cavity, cast, caps, block_bounds)
         cut, island_volume = _absorb_islands(cut, gating, block_bounds)
         layout.filled_volume += island_volume
-        final = CastFaces(cut, gating, surface) if layout.filled_volume > 0 else cast
+        final = CastFaces.of(cut, gating, surface) if layout.filled_volume > 0 else cast
         layout.remaining_locked_fraction = final.locked_area(locked_faces(final, caps))
     if caps:
         in_top, _ = core_sides(final, caps)
@@ -467,18 +512,19 @@ def plan_layout(
 
 def choose_main_direction(
     mesh: trimesh.Trimesh, parting: PartingResult, max_pieces: int, *, curved: bool = True
-) -> DirectionScore | None:
+) -> tuple[DirectionScore | None, float]:
     """The two-piece candidate that leaves the least locked area once side pieces are added.
 
     Ties go to fewer side pieces, then to the better two-piece score. Returns
-    None when the chosen two-piece direction already releases the part.
+    the candidate (None when the chosen two-piece direction already releases
+    the part) and the share of the surface it leaves locked, as estimated.
     """
     if not parting.candidates or parting.undercut_fraction == 0.0:
-        return None
+        return None, 0.0
     best_key, best = None, None
     for rank, score in enumerate(parting.candidates[:MAIN_CANDIDATES]):
         cavity = mesh.copy().apply_transform(mold_frame(mesh, score.direction, score.offset))
-        cast = CastFaces(cavity, [])
+        cast = CastFaces.of(cavity, [])
         caps = plan_caps(
             cast, max_pieces - 2, directions=QUICK_DIRECTIONS, quick=True, curved=curved
         )
@@ -492,9 +538,9 @@ def choose_main_direction(
         )
         if best_key is None or key < best_key:
             best_key, best = key, score
-        if locked == 0.0 and not caps:
-            break
-    return best
+        if locked <= GOOD_ENOUGH_LOCKED and len(caps) <= 2:
+            break  # the best two-piece direction already works with few side pieces
+    return best, best_key[0]
 
 
 class _Frame:
@@ -627,7 +673,7 @@ def plan_caps(
             gain = locked_area - cast.area[after].sum()
             big_enough: bool | None = None  # the size check is a boolean: only when needed
             if gain > true_gain:
-                big_enough = _piece_volume(cast, caps, cap) >= MIN_PIECE_FRACTION * cast.box_volume
+                big_enough = _big_enough(cast, caps, cap)
                 if big_enough:
                     true_gain, choice, choice_locked = gain, [cap], after
             if option.curved and len(caps) + 2 <= max_caps:
@@ -639,9 +685,7 @@ def plan_caps(
                 if pair_gain <= true_gain:
                     continue
                 if big_enough is None:
-                    big_enough = (
-                        _piece_volume(cast, caps, cap) >= MIN_PIECE_FRACTION * cast.box_volume
-                    )
+                    big_enough = _big_enough(cast, caps, cap)
                 if big_enough:
                     true_gain, choice, choice_locked = pair_gain, [cap, opposite], pair_after
         if not choice or true_gain < min_gain:
@@ -931,6 +975,36 @@ def _gain(
     return float(cast.area[freed].sum()), cap
 
 
+def _snap_to_block(cap: Cap, block_bounds: np.ndarray, cast_points: np.ndarray) -> Cap:
+    """Move side planes that come close to the block's outside all the way out to it.
+
+    A side plane a little inside the block leaves a slab of mold, outside the
+    cap, against the block face behind it; a slightly tilted plane leaves a
+    wedge that thins to nothing. Either would end up as a fragile sliver of
+    another piece. The cap takes the slab instead, unless some of the cast
+    (``cast_points``) lies in it, which the cap would then have to release too.
+    """
+    lo, hi = np.asarray(block_bounds, dtype=float)
+    corners = trimesh.bounds.corners(np.array([lo, hi]))
+    kept = list(cap.bounds)
+    for bound in cap.bounds:
+        normal, value = bound
+        # The block face behind the plane is the one facing most nearly against it.
+        axis = int(np.argmax(np.abs(normal)))
+        face = hi[axis] if normal[axis] < 0 else lo[axis]
+        behind = corners[np.isclose(corners[:, axis], face)]
+        if float((value - behind @ normal).min()) >= SNAP_TO_BLOCK_MM:
+            continue
+        wider = Cap(
+            cap.direction, cap.offset, cap.side, tuple(b for b in kept if b is not bound), cap.cut
+        )
+        if not np.any(wider.contains(cast_points) & (cast_points @ normal < value)):
+            kept = list(wider.bounds)
+    if len(kept) == len(cap.bounds):
+        return cap
+    return Cap(cap.direction, cap.offset, cap.side, tuple(kept), cap.cut)
+
+
 def _patch_directions(cast: CastFaces, faces: np.ndarray) -> np.ndarray:
     """Pull directions worth a curved cut for a locked patch, both ways along each.
 
@@ -968,9 +1042,7 @@ def _opposite(
     if spec is None:
         return None
     opposite = _build_curved(cast, direction, cap.side, spec.bounds, reverse.freed, quick=quick)
-    if opposite is None or _piece_volume(cast, taken, opposite) < (
-        MIN_PIECE_FRACTION * cast.box_volume
-    ):
+    if opposite is None or not _big_enough(cast, taken, opposite):
         return None
     return opposite, locked_faces(cast, [*taken, opposite])
 
@@ -1017,14 +1089,13 @@ def _build_curved(
     return None
 
 
-def _piece_volume(cast: CastFaces, caps: list[Cap], cap: Cap) -> float:
-    """Mold material ``cap`` would take within the cast's bounding box (a lower bound)."""
+def _big_enough(cast: CastFaces, caps: list[Cap], cap: Cap) -> bool:
+    """Whether ``cap`` would hold enough mold, within the cast's bounding box, to be a piece."""
     box = block_solid(cast.mesh.bounds)
-    taken = [earlier.region(box) for earlier in caps]
     region = cap.region(box) - cast.solid()
-    if taken:
-        region = region - Manifold.batch_boolean(taken, OpType.Add)
-    return float(region.volume())
+    if caps:
+        region = region - Manifold.batch_boolean([c.region(box) for c in caps], OpType.Add)
+    return float(region.volume()) >= MIN_PIECE_FRACTION * cast.box_volume
 
 
 def _parallel_planes(caps: list[Cap], direction: np.ndarray) -> list[float]:

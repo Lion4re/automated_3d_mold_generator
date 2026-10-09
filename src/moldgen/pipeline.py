@@ -18,7 +18,14 @@ import trimesh
 from moldgen import booleans
 from moldgen.config import MoldConfig
 from moldgen.gating import POUR_DIRECTIONS, GatingPlan, cross_section_to_shapely, plan_gating
-from moldgen.keys import KeyPlan, plan_keys, plan_keys_in_region, plan_keys_on_plane, plane_basis
+from moldgen.keys import (
+    BOOLEAN_OVERLAP,
+    KeyPlan,
+    plan_keys,
+    plan_keys_in_region,
+    plan_keys_on_plane,
+    plane_basis,
+)
 from moldgen.materials import (
     Material,
     PrintMaterial,
@@ -29,7 +36,9 @@ from moldgen.materials import (
 from moldgen.meshio import load_mesh, units_warning
 from moldgen.parting import PartingResult, analyze_parting
 from moldgen.pieces import (
+    GOOD_ENOUGH_LOCKED,
     QUICK_DIRECTIONS,
+    RIGID_LIMIT_LOCKED,
     UP,
     Cap,
     CastFaces,
@@ -43,6 +52,13 @@ from moldgen.pieces import (
     plan_caps,
     plan_layout,
     trim,
+)
+from moldgen.printcheck import (
+    MIN_WALL_FDM_MM,
+    MIN_WALL_RESIN_MM,
+    PieceCheck,
+    best_print_up,
+    check_piece,
 )
 from moldgen.repair import RepairReport, repair_mesh
 from moldgen.surface import KEY_MAX_SLOPE, PartingSurface, fit_surface
@@ -68,6 +84,9 @@ SEAM_SLAB_HALF_MM = 0.05
 """Half thickness of the slabs that keep keys of one seam off the other seams."""
 NOTICEABLE_FILL_MM3 = 10.0
 """Filling smaller than this (0.01 cm³) is reported in the summary but not warned about."""
+POST_SAMPLES = 16
+"""Points around a key's footprint where the curved face under it is measured."""
+
 SLIVER_VOLUME_FRACTION = 1e-4
 """Shells of the mold body smaller than this share of its volume are slivers, such as the
 bit of an air vent that crosses a hole's core, not a part of the cavity left unfilled."""
@@ -99,7 +118,7 @@ class MoldPiece:
     mesh: trimesh.Trimesh
     """The piece in its assembled position (mold frame)."""
     print_transform: np.ndarray
-    """Places the piece on the build plate with its parting face up."""
+    """Places the piece on the build plate the way it prints with the least support."""
     pull: np.ndarray = field(default_factory=lambda: np.zeros(3))
     """Direction the piece is pulled off the cast (mold frame)."""
 
@@ -130,6 +149,8 @@ class MoldResult:
     """The curved parting surface between the halves, or None for the plane z == 0."""
     pieces_catch: bool = False
     """True when sliding the finished pieces out found one that may catch (see warnings)."""
+    print_checks: list[PieceCheck] = field(default_factory=list)
+    """Printability of each piece, as it will lie on the bed (see :mod:`moldgen.printcheck`)."""
 
     def save(self, out_dir: str | Path) -> list[Path]:
         from moldgen.report import save_result
@@ -264,6 +285,29 @@ def generate_mold(
     parting: PartingResult | None = None,
     progress: ProgressCallback | None = None,
 ) -> MoldResult:
+    """Build all mold pieces for ``source`` and check them for printing.
+
+    ``parting`` lets interactive callers reuse an analysis they already ran
+    (it must have been computed on the prepared part's mesh).
+    """
+    config = config or MoldConfig()
+    result = _generate_mold(source, config, parting=parting, progress=progress)
+    bed = tuple(float(v) for v in config.bed_size_mm)
+    min_wall = MIN_WALL_RESIN_MM if result.print_material.resin_printed else MIN_WALL_FDM_MM
+    for piece in result.pieces:
+        check = check_piece(piece.name, piece.print_mesh(), bed, min_wall)
+        result.print_checks.append(check)
+        result.warnings.extend(check.warnings(bed, min_wall))
+    return result
+
+
+def _generate_mold(
+    source: str | Path | trimesh.Trimesh | PreparedPart,
+    config: MoldConfig | None = None,
+    *,
+    parting: PartingResult | None = None,
+    progress: ProgressCallback | None = None,
+) -> MoldResult:
     """Build all mold pieces for ``source``.
 
     ``parting`` lets interactive callers reuse an analysis they already ran
@@ -290,7 +334,7 @@ def generate_mold(
             draft_threshold_deg=config.draft_threshold_deg,
         )
     if config.pieces == "auto" and config.direction == "auto" and config.parting_offset is None:
-        main = choose_main_direction(
+        main, locked = choose_main_direction(
             part.mesh, parting, config.max_pieces, curved=config.side_piece_cuts == "auto"
         )
         if main is not None and not np.allclose(main.direction, parting.direction):
@@ -300,6 +344,21 @@ def generate_mold(
                 main.offset,
                 draft_threshold_deg=config.draft_threshold_deg,
             )
+        if locked >= RIGID_LIMIT_LOCKED:
+            log.info("side pieces leave %.0f%% locked; making a two-piece mold", 100 * locked)
+            result = _generate_mold(
+                part, replace(config, pieces=2), parting=parting, progress=progress
+            )
+            # Its advice to try side pieces is what was just ruled out.
+            result.warnings = [w for w in result.warnings if "--pieces auto" not in w]
+            result.warnings.insert(
+                0,
+                f"Even with side pieces about {locked:.0%} of the surface would lock (parts "
+                "that interlock or wrap around each other); a rigid mold cannot release this "
+                "part, so a plain two-piece mold was made. Use a flexible silicone mold, or "
+                "split the model into simpler parts and mold them separately.",
+            )
+            return result
     if config.pieces == 4 and parting.undercut_fraction > UNDERCUT_WARNING_FRACTION:
         warnings.append(
             f"{parting.undercut_fraction:.1%} of the surface is undercut for this parting plane; "
@@ -349,7 +408,7 @@ def generate_mold(
         surface = _curved_surface(cavity, gating, block_bounds, config)
         undercut = parting.undercut_fraction
         if surface is not None:
-            cast = CastFaces(cavity, gating.solids(), surface)
+            cast = CastFaces.of(cavity, gating.solids(), surface)
             locked = locked_faces(cast, [])
             layout = PieceLayout(
                 face_region=face_regions(cast, [], locked), locked_fraction=cast.locked_area(locked)
@@ -421,7 +480,7 @@ def generate_mold(
         # The pieces as built would catch: a curved parting surface is the likely cause.
         log.info("the pieces as planned would catch; trying again with a flat parting surface")
         flat = replace(config, parting_surface="flat")
-        return generate_mold(part, flat, parting=given_parting, progress=progress)
+        return _generate_mold(part, flat, parting=given_parting, progress=progress)
     warnings.extend(notes + problems)
 
     stages.start("Checking the result")
@@ -452,7 +511,7 @@ def generate_mold(
     if curved_caps:
         # The search with curved cuts is greedy, and the pieces it plans are checked
         # less exactly; keep whichever of it and flat side pieces gives the better mold.
-        flat = generate_mold(
+        flat = _generate_mold(
             part, replace(config, side_piece_cuts="flat"), parting=given_parting, progress=progress
         )
         if _mold_score(flat) <= _mold_score(result):
@@ -580,6 +639,7 @@ def _layout_pieces(
     solids: list[tuple[str, manifold3d.Manifold, np.ndarray]] = []
     key_plans: list[KeyPlan] = []
     for k, cap in enumerate(caps):
+        available = rest
         piece = cap_region(cap, rest)
         rest = rest - piece
         if config.keys > 0 and cap.cut is not None:
@@ -587,7 +647,8 @@ def _layout_pieces(
             if not cap.bounds:
                 _check_key_count(plan, SIDE_PIECE_KEYS, f"side piece {k + 1}", warnings)
             if len(plan.positions):
-                piece = piece + _joined(plan.male_solids())
+                # Posts stay in mold material: not in the cast or an earlier piece.
+                piece = piece + (_joined(plan.male_solids()) ^ available)
                 rest = rest - _joined(plan.female_solids())
                 key_plans.append(plan)
         elif config.keys > 0:
@@ -637,7 +698,7 @@ def _layout_pieces(
         plan = _surface_keys(surface, caps, block_bounds, config, key_radius, key_margin)
         _check_key_count(plan, min(config.keys, 2), "the parting surface", warnings)
         if len(plan.positions):
-            bottom = bottom + _joined(plan.male_solids())
+            bottom = bottom + (_joined(plan.male_solids()) ^ rest)
             top = top - _joined(plan.female_solids())
             key_plans.append(plan)
     elif config.keys > 0 and not (top.is_empty() or bottom.is_empty()):
@@ -666,7 +727,14 @@ def _layout_pieces(
             key_plans.append(plan)
     solids += [("top", top, UP), ("bottom", bottom, -UP)]
     block_volume = float(np.prod(block_bounds[1] - block_bounds[0]))
-    solids = [item for item in solids if item[1].volume() > SLIVER_VOLUME_FRACTION * block_volume]
+    # Cuts that graze the cast leave dust: bodies of no real size that would print as
+    # loose specks and catch in the removal check below.
+    limit = SLIVER_VOLUME_FRACTION * block_volume
+    solids = [
+        (name, manifold3d.Manifold.batch_boolean(kept, manifold3d.OpType.Add), pull)
+        for name, solid, pull in solids
+        if (kept := [body for body in solid.decompose() if body.volume() > limit])
+    ]
     (warnings if problems is None else problems).extend(
         _removal_warnings(solids, obstacles, block_bounds)
     )
@@ -735,7 +803,7 @@ def _gating_for_pieces(
                 option = place_gating(option)
             except ValueError:
                 continue
-        cast = CastFaces(cavity, option.solids())
+        cast = CastFaces.of(cavity, option.solids())
         caps = plan_caps(
             cast, max_pieces - 2, directions=QUICK_DIRECTIONS, quick=True, curved=curved
         )
@@ -743,7 +811,7 @@ def _gating_for_pieces(
         key = (round(locked, 3), len(caps), rank)
         if best_key is None or key < best_key:
             best_key, best = key, option
-        if locked == 0.0:
+        if locked <= GOOD_ENOUGH_LOCKED:
             break
     return best
 
@@ -766,7 +834,7 @@ def _curved_surface(
         return None
     scores = []
     for surface in (None, candidate):
-        cast = CastFaces(cavity, solids, surface)
+        cast = CastFaces.of(cavity, solids, surface)
         caps = []
         if config.pieces == "auto":
             caps = plan_caps(
@@ -784,11 +852,7 @@ def _surface_keys(
     key_radius: float,
     key_margin: float,
 ) -> KeyPlan:
-    """Keys on the gently sloping parts of a curved parting surface, away from the cast.
-
-    Each key stands at the surface's height where it is placed; the slope
-    limit keeps the key's base inside the bottom piece all round.
-    """
+    """Keys on the gently sloping parts of a curved parting surface, away from the cast."""
     usable = (surface.slope() <= KEY_MAX_SLOPE) & ~surface.covered
     points = np.column_stack([surface.nodes(), surface.heights.ravel()])
     for cap in caps:
@@ -804,9 +868,7 @@ def _surface_keys(
         clearance=config.clearance,
         margin=key_margin,
     )
-    if len(plan.positions):
-        plan.positions[:, 2] = surface.height(plan.positions[:, :2])
-    return plan
+    return _stand_on(plan, surface, np.eye(3), 1.0)
 
 
 def _cut_keys(
@@ -846,9 +908,26 @@ def _cut_keys(
         clearance=config.clearance,
         margin=key_margin,
     )
-    if len(plan.positions):
-        uv = plan.positions @ rows[:2].T
-        plan.positions = plan.positions + field.height(uv)[:, None] * rows[2]
+    return _stand_on(plan, field, rows, -1.0)
+
+
+def _stand_on(plan: KeyPlan, field: PartingSurface, rows: np.ndarray, sign: float) -> KeyPlan:
+    """Move keys planned in ``rows`` coordinates onto the curved face ``field``.
+
+    Each key stands on the highest point of the face under it (along its
+    normal, which is ``sign * rows[2]``), so it stands out by its full height
+    all round, and its post reaches down past the lowest point, so it is
+    anchored all round.
+    """
+    if not len(plan.positions):
+        return plan
+    angles = np.linspace(0.0, 2.0 * np.pi, POST_SAMPLES, endpoint=False)
+    ring = plan.footprint_radius * np.column_stack([np.cos(angles), np.sin(angles)])
+    uv = plan.positions @ rows[:2].T
+    under = np.concatenate([uv[:, None, :], uv[:, None, :] + ring], axis=1)
+    heights = sign * field.height(under.reshape(-1, 2)).reshape(len(uv), -1)
+    plan.positions = plan.positions + sign * heights.max(axis=1)[:, None] * rows[2]
+    plan.base_depth = BOOLEAN_OVERLAP + float(np.ptp(heights, axis=1).max())
     return plan
 
 
@@ -900,8 +979,14 @@ def _slab(block_bounds: np.ndarray, normal: np.ndarray, offset: float) -> trimes
 
 
 def _print_transform_along(mesh: trimesh.Trimesh, pull: np.ndarray) -> np.ndarray:
-    """Turn the side facing against ``pull`` up, then rest the piece on z == 0."""
-    transform = trimesh.geometry.align_vectors(-np.asarray(pull, dtype=float), [0.0, 0.0, 1.0])
+    """Turn the piece so it prints with the least support, then rest it on z == 0.
+
+    The side facing against ``pull`` goes up when that works (the cavity then
+    opens upwards); a side piece pulled at an angle may instead lie on one of
+    its large flat faces.
+    """
+    up = best_print_up(mesh, -np.asarray(pull, dtype=float))
+    transform = trimesh.geometry.align_vectors(up, [0.0, 0.0, 1.0])
     vertices = trimesh.transform_points(mesh.vertices, transform)
     lo, hi = vertices.min(axis=0), vertices.max(axis=0)
     shift = np.array([-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]])
