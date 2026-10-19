@@ -89,4 +89,4 @@ The sample chess models and the multi-piece test parts are unchanged.
 - **Grid resolution.** The surface is resolved at the grid spacing. Near very
   steep or very thin parts of the outline a narrow strip can stay locked; it
   is reported, and in auto mode side pieces or filling take care of it.
-- **Side pieces cut flat.** Curved side pieces are the next step.
+- Side pieces can be curved too; see `docs/multi-piece-design.md`.

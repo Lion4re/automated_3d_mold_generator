@@ -58,6 +58,12 @@ COARSEST_NODES = 12
 KEY_MAX_SLOPE = 0.08
 """Steepest surface (rise over run) on which registration keys are placed."""
 
+CUT_RELAX_ITERATIONS = 80
+"""Relaxation sweeps per level for a side piece's cut, which is fixed on most of its grid."""
+
+CUT_RAISE_ROUNDS = 3
+"""Times a side piece's cut is raised over faces it may not take, then refitted."""
+
 
 @dataclass
 class PartingSurface:
@@ -109,11 +115,18 @@ class PartingSurface:
         return np.stack(np.meshgrid(x, y, indexing="ij"), axis=-1).reshape(-1, 2)
 
     def below(self, floor: float) -> Manifold:
-        """The solid between the surface and the plane ``z == floor``."""
+        """The solid between the surface and the plane ``z == floor`` under it."""
+        return self.between(floor)
+
+    def between(self, level: float) -> Manifold:
+        """The solid between the surface and the plane ``z == level``, above or below it all."""
         nx, ny = self.heights.shape
         xy = self.nodes()
-        top = np.column_stack([xy, self.heights.ravel()])
-        bottom = np.column_stack([xy, np.full(len(xy), floor)])
+        flat = np.full(len(xy), level)
+        heights = self.heights.ravel()
+        upper, lower = (heights, flat) if level <= heights.min() else (flat, heights)
+        top = np.column_stack([xy, upper])
+        bottom = np.column_stack([xy, lower])
         vertices = np.vstack([top, bottom])
         n = len(top)
         index = np.arange(n).reshape(nx, ny)
@@ -195,7 +208,7 @@ def _hold_channels(
         upper[hold] = value[hold]
 
 
-def _relax(lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
+def _relax(lower: np.ndarray, upper: np.ndarray, iterations: int = RELAX_ITERATIONS) -> np.ndarray:
     """Smoothest heights within ``[lower, upper]``: projected over-relaxation, coarse to fine."""
     levels = [(lower, upper)]
     while min(levels[-1][0].shape) > 2 * COARSEST_NODES:
@@ -207,24 +220,130 @@ def _relax(lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
             factors = np.array(lo.shape) / np.array(heights.shape)
             heights = zoom(heights, factors, order=1, mode="nearest", grid_mode=True)
             heights = heights[: lo.shape[0], : lo.shape[1]]
-        heights = _sweeps(np.clip(heights, lo, hi), lo, hi, RELAX_ITERATIONS)
+        heights = _sweeps(np.clip(heights, lo, hi), lo, hi, iterations)
     return heights
 
 
 def _sweeps(h: np.ndarray, lower: np.ndarray, upper: np.ndarray, count: int) -> np.ndarray:
-    """Red-black over-relaxation of the Laplace equation, clipped to the bounds every pass."""
-    i, j = np.indices(h.shape)
-    colours = [(i + j) % 2 == 0, (i + j) % 2 == 1]
+    """Red-black over-relaxation of the Laplace equation on the nodes the bounds leave free.
+
+    Every bound is either a fixed value (``lower == upper``) or none at all, so
+    free nodes need no clipping and fixed ones are never touched.
+    """
     free = lower < upper
     if not free.any():
         return h
+    h = np.where(free, h, lower)
+    i, j = np.indices(h.shape)
+    colours = [free & ((i + j) % 2 == 0), free & ((i + j) % 2 == 1)]
+    padded = np.empty((h.shape[0] + 2, h.shape[1] + 2))
     for _ in range(count):
         for colour in colours:
-            padded = np.pad(h, 1, mode="edge")  # zero slope at the grid's border
+            # Edge rows and columns repeat the border: zero slope at the grid's edge.
+            padded[1:-1, 1:-1] = h
+            padded[0, 1:-1], padded[-1, 1:-1] = h[0], h[-1]
+            padded[1:-1, 0], padded[1:-1, -1] = h[:, 0], h[:, -1]
             mean = 0.25 * (
                 padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:]
             )
-            update = colour & free
-            h = np.where(update, h + OVER_RELAXATION * (mean - h), h)
-            h = np.clip(h, lower, upper)
+            h[colour] += OVER_RELAXATION * (mean[colour] - h[colour])
     return h
+
+
+@dataclass
+class CutSurface:
+    """A curved cut for a side piece: the piece lies where ``dot(p, n) >= g(u, v)``.
+
+    ``rows`` are ``(e1, e2, n)``: two unit vectors across the pull and the
+    pull ``n`` itself, with ``u = dot(p, e1)`` and ``v = dot(p, e2)``. ``field``
+    holds ``g`` on a grid over ``(u, v)``.
+    """
+
+    rows: np.ndarray
+    field: PartingSurface
+
+    def depth(self, points: np.ndarray) -> np.ndarray:
+        """The cut's position along the pull on the line through each point."""
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        return self.field.height(points @ self.rows[:2].T)
+
+    def beyond(self, points: np.ndarray) -> np.ndarray:
+        """How far each point lies past the cut along the pull (negative: behind it)."""
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        return points @ self.rows[2] - self.depth(points)
+
+    def solid(self, reach: float) -> Manifold:
+        """Everything past the cut, up to ``reach`` along the pull, inside the grid."""
+        local = self.field.between(float(self.field.heights.max()) + reach)
+        return local.transform(np.column_stack([self.rows.T, np.zeros(3)]))
+
+
+def fit_cut(
+    cast: trimesh.Trimesh,
+    rows: np.ndarray,
+    uv_bounds: np.ndarray,
+    cell: float,
+    keep_behind: np.ndarray | None = None,
+    keep_beyond: np.ndarray | None = None,
+    iterations: int = CUT_RELAX_ITERATIONS,
+) -> CutSurface:
+    """The cut that gives a side piece every bit of mold beyond the cast along its pull.
+
+    On each line along the pull (``rows[2]``) that meets the cast, the cut runs
+    just inside the cast's far end, so the piece takes all the mold past it; on
+    lines that miss the cast it is as smooth as possible. ``keep_beyond`` are
+    points the cut must pass behind (vertices of faces the piece is meant to
+    take) and ``keep_behind`` points it must pass beyond (vertices of faces it
+    cannot release); both hold on the grid nodes around each point, and
+    ``keep_behind`` wins where they meet.
+    """
+    lo, hi = np.asarray(uv_bounds, dtype=float)
+    origin = lo - cell
+    shape = tuple(np.ceil((hi - lo) / cell).astype(np.int64) + 3)
+    field = PartingSurface(origin=origin, cell=cell, heights=np.zeros(shape))
+    local = trimesh.Trimesh(cast.vertices @ rows.T, cast.faces, process=False)
+    nodes = field.nodes()
+    low, high = column_spans(local, nodes)
+    hit = np.isfinite(high)
+    field.covered = hit.reshape(shape)
+    target = np.full(len(nodes), -np.inf)
+    span = np.where(hit, high - low, 0.0)
+    target[hit] = high[hit] - np.minimum(INSET_MM, 0.25 * span[hit])
+    if keep_beyond is not None and len(keep_beyond):
+        _hold_near(field, keep_beyond @ rows.T, target, -INSET_MM, lowest=True)
+    if keep_behind is not None and len(keep_behind):
+        _hold_near(field, keep_behind @ rows.T, target, INSET_MM, lowest=False)
+    fixed = np.isfinite(target)
+    lower = np.where(fixed, target, -np.inf)
+    upper = np.where(fixed, target, np.inf)
+    field.heights = _relax(lower.reshape(shape), upper.reshape(shape), iterations)
+    return CutSurface(rows=np.asarray(rows, dtype=float), field=field)
+
+
+def _hold_near(
+    field: PartingSurface, points: np.ndarray, target: np.ndarray, shift: float, *, lowest: bool
+) -> None:
+    """Hold the cut at each local point's height plus ``shift`` on the grid nodes around it.
+
+    With ``lowest`` the cut may go no further along the pull than that (the
+    smallest such height wins); otherwise it must go at least that far (the
+    largest wins). ``target`` is -inf where a node is still free.
+    """
+    nx, ny = field.heights.shape
+    index = (points[:, :2] - field.origin) / field.cell
+    # The cut's height at a point depends only on the corners of the cell it lies in.
+    i0 = np.clip(np.floor(index[:, 0]).astype(np.int64), 0, nx - 1)
+    j0 = np.clip(np.floor(index[:, 1]).astype(np.int64), 0, ny - 1)
+    di, dj = np.meshgrid(np.arange(2), np.arange(2), indexing="ij")
+    i = np.clip(i0[:, None] + di.ravel(), 0, nx - 1)
+    j = np.clip(j0[:, None] + dj.ravel(), 0, ny - 1)
+    nodes = (i * ny + j).ravel()
+    values = np.repeat(points[:, 2] + shift, di.size)
+    if not lowest:
+        np.maximum.at(target, nodes, values)
+        return
+    bound = np.full(len(target), np.inf)
+    np.minimum.at(bound, nodes, values)
+    held = np.isfinite(bound)
+    current = target[held]
+    target[held] = np.where(np.isfinite(current), np.minimum(current, bound[held]), bound[held])

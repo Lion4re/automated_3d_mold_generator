@@ -67,6 +67,10 @@ class MoldConfig:
     max_pieces: int = 6
     """Most pieces "auto" may use; areas still locked are filled in the cavity."""
 
+    side_piece_cuts: str = "auto"
+    """"auto" lets side pieces follow the cast with curved cuts where that releases more;
+    "flat" always cuts them with planes."""
+
     parting_surface: str = "auto"
     """"auto" lets the parting between the halves curve along the part where a flat
     plane would leave undercuts; "flat" always uses the plane."""
@@ -137,6 +141,8 @@ class MoldConfig:
             raise ConfigError("Scale must be positive")
         if self.pieces not in (2, 4, "auto"):
             raise ConfigError("Pieces must be 2, 4 or auto")
+        if self.side_piece_cuts not in ("auto", "flat"):
+            raise ConfigError("Side piece cuts must be auto or flat")
         if self.parting_surface not in ("auto", "flat"):
             raise ConfigError("Parting surface must be auto or flat")
         if not MIN_AUTO_PIECES <= self.max_pieces <= MAX_AUTO_PIECES:

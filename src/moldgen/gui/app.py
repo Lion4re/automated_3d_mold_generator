@@ -246,6 +246,13 @@ class MoldGui:
                 initial_value=d.max_pieces,
                 hint="Most pieces Automatic may use. Areas still locked are filled in the cavity.",
             )
+            self.side_piece_cuts = gui.add_dropdown(
+                "Side piece cuts",
+                tuple(st.SIDE_PIECE_CUT_OPTIONS),
+                initial_value=st.label_for(st.SIDE_PIECE_CUT_OPTIONS, d.side_piece_cuts),
+                hint="Curved cuts follow the part and can save pieces; generating takes longer "
+                "because both kinds are compared.",
+            )
             self.parting_surface = gui.add_dropdown(
                 "Parting surface",
                 tuple(st.PARTING_SURFACE_OPTIONS),
@@ -366,6 +373,7 @@ class MoldGui:
             self.print_material,
             self.pieces,
             self.max_pieces,
+            self.side_piece_cuts,
             self.parting_surface,
             self.wall_auto,
             self.wall,
@@ -461,6 +469,7 @@ class MoldGui:
             pieces=st.PIECE_OPTIONS[self.pieces.value],
             max_pieces=int(self.max_pieces.value),
             parting_surface=st.PARTING_SURFACE_OPTIONS[self.parting_surface.value],
+            side_piece_cuts=st.SIDE_PIECE_CUT_OPTIONS[self.side_piece_cuts.value],
             wall_auto=self.wall_auto.value,
             wall_thickness=float(self.wall.value),
             keys=int(self.keys.value),
@@ -499,6 +508,7 @@ class MoldGui:
             self.print_material,
             self.pieces,
             self.max_pieces,
+            self.side_piece_cuts,
             self.parting_surface,
             self.wall_auto,
             self.keys,
@@ -511,6 +521,7 @@ class MoldGui:
         ):
             handle.disabled = generating
         self.max_pieces.visible = self.pieces.value == st.AUTO_PIECES
+        self.side_piece_cuts.visible = self.pieces.value == st.AUTO_PIECES
         # Four pieces always split along a flat plane.
         self.parting_surface.visible = st.PIECE_OPTIONS[self.pieces.value] != 4
         self.wall.disabled = generating or self.wall_auto.value

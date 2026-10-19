@@ -89,6 +89,62 @@ triggered on the test parts.
    nearly meet an opposite cap's plane it overlaps it instead, because that
    space is already empty. Otherwise both would leave a zero-thickness sliver.
 
+## Curved side pieces
+
+With `side_piece_cuts = "auto"` (the default; `--flat-side-pieces` turns it
+off), a side piece can be cut with a height field along its pull instead of a
+plane: the piece takes everything with `dot(p, d) >= g(u, v)`, where `(u, v)`
+are coordinates across the pull (`surface.CutSurface`).
+
+- **Why it still comes apart.** Moving along `d` raises `dot(p, d)` and leaves
+  `(u, v)` unchanged, so the piece never leaves its reach, exactly as with a
+  plane. The rule is the same: every cast face in the reach must release
+  along `d`.
+- **The cut** (`surface.fit_cut`). On each line along the pull that meets the
+  cast, the cut runs just inside the cast's far end. The piece therefore takes
+  all mold beyond the cast on that line and nothing else. On lines that miss
+  the cast it is smooth (harmonic). It is then held behind the vertices of the
+  faces the piece should take, and in front of any face in its reach that the
+  pull cannot release, and refitted, up to three rounds.
+- **No global floor.** A flat cut must clear the highest blocking face anywhere
+  in its box. A curved cut only has to clear blocking faces on their own lines.
+  Inside a ring handle, two opposite curved pieces meet exactly at the hole's
+  narrowest point, with no strip left over.
+- **Search.**
+  - Curved pieces are boxed in around one locked patch. An open one would take
+    every bit of mold the cast shows along its pull.
+  - They are tried along the axes and along each patch's own axes: the
+    direction its faces are most nearly parallel to (a hole's axis) and its
+    average facing direction.
+  - Each candidate is also tried together with its opposite piece around the
+    same patch, and candidates are compared by the locked area released per
+    piece. A one-at-a-time greedy choice otherwise prefers oblique pieces that
+    free a little more at first and leave the rest harder to reach.
+- **Checks.** The planner tests faces against the cut at their vertices. The
+  test for what a half sweeps past samples each path against curved pieces.
+  Both are close but not exact, so the finished pieces are slid out as exact
+  solids as before.
+- **Choosing curved or flat.** The search is greedy, so when the plan uses any
+  curved cut, the mold is also built with flat side pieces only, and the
+  better one is kept. The ranking is: no catching piece, then less locked
+  area, then fewer pieces, then less filling (`pipeline._mold_score`). If a
+  layout without curved side pieces still catches and used a curved parting
+  surface, it is rebuilt with a flat one. Auto mode is therefore never worse
+  than flat cuts.
+- **Keys** go on the stretches of the cut that run through mold rather than
+  along the cast, where the cut slopes gently. There must be mold behind them
+  that no earlier piece took.
+
+Results:
+
+| Part | Flat side pieces | Curved side pieces |
+|---|---|---|
+| Knight split across its axis | 5 pieces, 0.06 cm³ filled | 3 pieces, nothing filled |
+| Ball with two ring handles | 4 pieces, 0.16 cm³ filled | 4 pieces, nothing filled |
+
+On the pawn, the bishop and the drilled blocks the flat layout was as good or
+better and was kept.
+
 ## Locked areas
 
 Faces still locked after the caps are filled:
@@ -136,15 +192,18 @@ share before filling, the volume added and the share still flagged after it.
 
 ## Known limits
 
-- **Flat cuts.** Cuts are flat and caps are peeled in a fixed, greedy order.
-  Where two caps meet in the narrowest part of a curved hole, a strip about one
-  face wide can be left. It is filled and shows up as thin flash in the hole.
+- **Greedy order.** Caps are planned one (or one opposite pair) at a time, so
+  some shapes get more pieces than an optimal layout would.
+- **Flat cuts in holes.** Where two flat caps meet in the narrowest part of a
+  curved hole, a strip about one face wide can be left. It is filled and shows
+  up as thin flash in the hole. Curved caps avoid this when they are chosen.
 - **Over-filling.** Prism filling extrudes to the parting plane, so it can
   over-fill below a locked face when the cast has a hole underneath. The
   reported filled volume shows this.
 - **Gating.** The sprue and vents are planned for the two halves first. The
   planner only chooses among the four pour sides; it does not reroute the sprue
   around side pieces.
-- **Speed.** Parts that need side pieces take about 5 to 15 s on a laptop.
-  Parts that do not need them cost at most half a second more than the
-  two-piece mold.
+- **Speed.** Parts that need side pieces take about 20 to 70 s on a laptop,
+  because a layout with curved side pieces is compared with one with flat
+  side pieces (`--flat-side-pieces` skips that). Parts that need no side
+  pieces cost at most half a second more than the two-piece mold.

@@ -77,6 +77,7 @@ AUTO_PIECES = "Automatic"
 PIECE_OPTIONS: dict[str, int | str] = {AUTO_PIECES: "auto", "2 pieces": 2, "4 pieces": 4}
 MAX_PIECES_RANGE = (MIN_AUTO_PIECES, MAX_AUTO_PIECES)
 PARTING_SURFACE_OPTIONS: dict[str, str] = {"Curved where needed": "auto", "Flat": "flat"}
+SIDE_PIECE_CUT_OPTIONS: dict[str, str] = {"Curved where it helps": "auto", "Flat (faster)": "flat"}
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +100,7 @@ class MoldSettings:
     pieces: int | str = "auto"
     max_pieces: int = 6
     parting_surface: str = "auto"
+    side_piece_cuts: str = "auto"
     wall_auto: bool = True
     wall_thickness: float = 10.0
     keys: int = 4
@@ -130,6 +132,7 @@ class MoldSettings:
             pieces=config.pieces,
             max_pieces=config.max_pieces,
             parting_surface=config.parting_surface,
+            side_piece_cuts=config.side_piece_cuts,
             wall_auto=config.wall_thickness is None,
             wall_thickness=config.wall_thickness or material.min_wall_mm,
             keys=config.keys,
@@ -165,6 +168,7 @@ def to_config(settings: MoldSettings, parting: PartingResult | None = None) -> M
         pieces=settings.pieces if settings.pieces == "auto" else int(settings.pieces),
         max_pieces=int(settings.max_pieces),
         parting_surface=settings.parting_surface,
+        side_piece_cuts=settings.side_piece_cuts,
         wall_thickness=None if settings.wall_auto else float(settings.wall_thickness),
         shrinkage=float(settings.shrinkage_percent) / 100.0
         if settings.shrinkage_override
