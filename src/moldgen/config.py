@@ -166,6 +166,17 @@ class MoldConfig:
             raise ConfigError("Keys must be between 0 and 8")
         if not 0 <= self.clearance <= 2:
             raise ConfigError("Clearance must be between 0 and 2 mm")
+        if self.key_diameter is not None and self.keys > 0:
+            from moldgen.keys import KeyPlan
+
+            plan = KeyPlan(np.zeros(3), np.empty((0, 3)), self.key_diameter / 2, self.clearance)
+            try:
+                plan._check_size()
+            except ValueError:
+                raise ConfigError(
+                    f"A {self.key_diameter:g} mm key is too small for a {self.clearance:g} mm "
+                    "clearance; use a larger key diameter or a smaller clearance"
+                ) from None
         if not 0 <= self.draft_threshold_deg < 45:
             raise ConfigError("Draft threshold must be between 0 and 45 degrees")
         self.direction_vector()

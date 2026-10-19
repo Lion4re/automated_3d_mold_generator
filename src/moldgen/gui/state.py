@@ -59,7 +59,7 @@ PIECE_COLORS: tuple[RGB, ...] = (
 )
 FILLED_COLOR: RGB = FACE_COLORS[FACE_UNDERCUT]
 FILLED = -1
-"""Face label for areas no piece can release, where the cavity was filled."""
+"""Face label for areas no piece can release (filled in the cavity, or left locked)."""
 PLANE_COLOR: RGB = (56, 110, 182)
 
 AUTO_DIRECTION = "Auto (best)"
@@ -488,12 +488,14 @@ def face_pieces(
 def legend_rows(info: Mapping[str, Any]) -> list[tuple[str, str, RGB]]:
     """(name, pull direction, colour) per piece of :func:`moldgen.report.summary`.
 
-    A "filled" row with the share of the surface follows when locked areas were filled.
+    A "filled" row with the share of the surface follows when locked areas were
+    filled, or a "locked" row when they were left as they are.
     """
     rows = [(p["name"], p["pull_label"], piece_color(i)) for i, p in enumerate(info["pieces"])]
     layout = info.get("layout")
     if layout and layout["locked_fraction"] > 0:
-        rows.append(("filled", _percent(layout["locked_fraction"]), FILLED_COLOR))
+        label = "filled" if layout.get("filled_volume_cm3", 0) > 0 else "locked"
+        rows.append((label, _percent(layout["locked_fraction"]), FILLED_COLOR))
     return rows
 
 

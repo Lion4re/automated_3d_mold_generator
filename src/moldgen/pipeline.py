@@ -88,8 +88,9 @@ POST_SAMPLES = 16
 """Points around a key's footprint where the curved face under it is measured."""
 
 SLIVER_VOLUME_FRACTION = 1e-4
-"""Shells of the mold body smaller than this share of its volume are slivers, such as the
-bit of an air vent that crosses a hole's core, not a part of the cavity left unfilled."""
+"""Shells smaller than this share of the mold body's volume are slivers, such as the bit of
+an air vent that crosses a hole's core, not a part of the cavity left unfilled. Bodies of a
+piece smaller than this share of the cast's bounding box are dust from the cuts."""
 REMOVAL_STEPS_FRACTION = (0.01, 0.05, 0.2, 1.0)
 """Distances (times the block size) each piece is slid along its pull to check removal."""
 REMOVAL_OVERLAP_FRACTION = 1e-4
@@ -726,10 +727,13 @@ def _layout_pieces(
             top = top - _joined(plan.female_solids())
             key_plans.append(plan)
     solids += [("top", top, UP), ("bottom", bottom, -UP)]
-    block_volume = float(np.prod(block_bounds[1] - block_bounds[0]))
     # Cuts that graze the cast leave dust: bodies of no real size that would print as
-    # loose specks and catch in the removal check below.
-    limit = SLIVER_VOLUME_FRACTION * block_volume
+    # loose specks and catch in the removal check below. Dust scales with the cast, not
+    # the block, so a small side piece in a thick block is not mistaken for it.
+    cast_bounds = np.array([mesh.bounds for mesh in obstacles])
+    limit = SLIVER_VOLUME_FRACTION * float(
+        np.prod(cast_bounds[:, 1].max(axis=0) - cast_bounds[:, 0].min(axis=0))
+    )
     solids = [
         (name, manifold3d.Manifold.batch_boolean(kept, manifold3d.OpType.Add), pull)
         for name, solid, pull in solids

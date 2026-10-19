@@ -657,7 +657,7 @@ def plan_caps(
                 )
                 gain, cap = _gain(cast, option, in_top, in_bottom, locked, exact=True)
                 if gain > best_gain:
-                    best_gain, best = gain, cap
+                    best_gain, best, best_option = gain, cap, option
         # A cap can also lock faces in the paths of the pieces after it, so
         # judge the shortlist by the locked area that is actually left, per piece.
         locked_area = cast.area[locked].sum()
