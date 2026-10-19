@@ -38,6 +38,7 @@ and each ray is tested against the triangles of its cell.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -455,8 +456,41 @@ def _first_hit(tris: np.ndarray, planes: np.ndarray, points: np.ndarray) -> np.n
     Same frame and arguments as :func:`_blocked`; inf where nothing is hit.
     """
     hit = np.full(len(points), np.inf)
+    for q, height in _column_heights(tris, planes, points, above_only=True):
+        gap = height - points[q, 2]
+        ahead = gap > 0
+        np.minimum.at(hit, q[ahead], gap[ahead])
+    return hit
+
+
+def column_spans(mesh: trimesh.Trimesh, xy: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Lowest and highest point of ``mesh`` on the vertical line through each ``xy`` point.
+
+    Both are inf / -inf where the line misses the mesh.
+    """
+    xy = np.asarray(xy, dtype=float).reshape(-1, 2)
+    low = np.full(len(xy), np.inf)
+    high = np.full(len(xy), -np.inf)
+    tris = mesh.triangles[np.abs(mesh.face_normals[:, 2]) > FACING_EPS]
+    points = np.column_stack([xy, np.zeros(len(xy))])
+    for q, height in _column_heights(tris, _barycentric_planes(tris), points, above_only=False):
+        np.minimum.at(low, q, height)
+        np.maximum.at(high, q, height)
+    return low, high
+
+
+def _column_heights(
+    tris: np.ndarray, planes: np.ndarray, points: np.ndarray, *, above_only: bool
+) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+    """Yield, in batches, each point that lies over a triangle and the triangle's height there.
+
+    ``tris``, ``planes`` and ``points`` are as for :func:`_blocked`. Triangles are
+    binned into a uniform grid over their XY footprints, so each point is only
+    tested against the triangles of its own cell. With ``above_only``, cells
+    whose triangles all lie below a point are skipped for that point.
+    """
     if len(tris) == 0 or len(points) == 0:
-        return hit
+        return
 
     uv = tris[:, :, :2]
     lo = uv.min(axis=1)
@@ -478,18 +512,19 @@ def _first_hit(tris: np.ndarray, planes: np.ndarray, points: np.ndarray) -> np.n
     cell_tris = tri_ids[np.argsort(cells)]
     cell_count = np.bincount(cells, minlength=n_cells)
     cell_start = np.cumsum(cell_count) - cell_count
-    cell_top = np.full(n_cells, -np.inf)
-    np.maximum.at(cell_top, cells, tris[:, :, 2].max(axis=1)[tri_ids])
 
     rel = points[:, :2] - origin
     queries = np.flatnonzero(np.all((rel >= 0.0) & (rel <= span), axis=1))
     q_cell_2d = np.minimum((rel[queries] / cell).astype(np.int64), shape - 1)
     q_cell = q_cell_2d[:, 0] * shape[1] + q_cell_2d[:, 1]
-    reachable = cell_top[q_cell] > points[queries, 2]
-    queries = queries[reachable]
-    q_cell = q_cell[reachable]
+    if above_only:
+        cell_top = np.full(n_cells, -np.inf)
+        np.maximum.at(cell_top, cells, tris[:, :, 2].max(axis=1)[tri_ids])
+        reachable = cell_top[q_cell] > points[queries, 2]
+        queries = queries[reachable]
+        q_cell = q_cell[reachable]
     if len(queries) == 0:
-        return hit
+        return
 
     pair_count = cell_count[q_cell]
     splits = np.searchsorted(
@@ -503,12 +538,8 @@ def _first_hit(tris: np.ndarray, planes: np.ndarray, points: np.ndarray) -> np.n
         pair_planes = planes[cell_tris[cell_start[q_cell[chunk]][owner] + slot]]
         inside = _inside(pair_planes, points[q, :2])
         q = q[inside]
-        p = points[q]
         h = pair_planes[inside, 2]
-        gap = h[:, 0] * p[:, 0] + h[:, 1] * p[:, 1] + h[:, 2] - p[:, 2]
-        ahead = gap > 0
-        np.minimum.at(hit, q[ahead], gap[ahead])
-    return hit
+        yield q, h[:, 0] * points[q, 0] + h[:, 1] * points[q, 1] + h[:, 2]
 
 
 def _inside(planes: np.ndarray, uv: np.ndarray) -> np.ndarray:

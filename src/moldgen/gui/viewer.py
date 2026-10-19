@@ -1,9 +1,11 @@
-"""3D scene of the GUI: the coloured part, the parting plane and the mold.
+"""3D scene of the GUI: the coloured part, the parting plane or surface and the mold.
 
 Everything lives under the ``/scene`` frame, which is shifted so the loaded
 part sits centred on the ground grid. Inside ``/scene`` the coordinates are
 the part's input frame in millimetres. Mold pieces are mapped back from the
 mold frame, so the mold appears around the part where the user saw it.
+A curved parting surface of a generated mold takes the place of the plane
+until the mold is cleared.
 """
 
 from __future__ import annotations
@@ -57,6 +59,7 @@ class Viewer:
         self._plane: Any = None
         self._plane_direction: np.ndarray | None = None
         self._plane_visible = True
+        self._surface: Any = None
         self._pieces: list[Any] = []
         self._piece_dirs: np.ndarray | None = None
         self._piece_corners: list[np.ndarray] = []
@@ -178,7 +181,7 @@ class Viewer:
                 translation_limits=((-1e6, 1e6),) * 3,
                 wxyz=frame.wxyz,
                 position=frame.position,
-                visible=self._plane_visible,
+                visible=self._plane_visible and self._surface is None,
             )
             handle.on_update(on_drag)
             quad_vertices, quad_faces = st.quad_mesh(frame.half_size)
@@ -211,10 +214,13 @@ class Viewer:
             self._plane.position = frame.position
 
     def set_plane_visible(self, visible: bool) -> None:
+        """Show or hide the parting: the curved surface if there is one, else the plane."""
         with self._lock:
             self._plane_visible = visible
+            if self._surface is not None:
+                self._surface.visible = visible
             if self._plane is not None:
-                self._plane.visible = visible
+                self._plane.visible = visible and self._surface is None
 
     def remove_plane(self) -> None:
         with self._lock:
@@ -222,6 +228,38 @@ class Viewer:
                 self._plane.remove()
             self._plane = None
             self._plane_direction = None
+
+    def show_surface(self, result: MoldResult) -> None:
+        """Show the result's curved parting surface in place of the plane."""
+        if result.surface is None:
+            return
+        vertices, faces = st.surface_mesh(result.surface, result.block_bounds)
+        vertices = trimesh.transform_points(vertices, result.parting.from_mold)
+        with self._lock:
+            self.remove_surface()
+            self._surface = self.server.scene.add_mesh_simple(
+                "/scene/surface",
+                vertices,
+                faces,
+                color=st.PLANE_COLOR,
+                opacity=PLANE_OPACITY,
+                side="double",
+                cast_shadow=False,
+                receive_shadow=False,
+                visible=self._plane_visible,
+            )
+            if self._plane is not None:
+                self._plane.visible = False
+
+    def remove_surface(self) -> None:
+        """Remove the curved parting surface and bring the plane back."""
+        with self._lock:
+            if self._surface is None:
+                return
+            self._surface.remove()
+            self._surface = None
+            if self._plane is not None:
+                self._plane.visible = self._plane_visible
 
     # ------------------------------------------------------------------
     # Mold
@@ -260,9 +298,11 @@ class Viewer:
             self._piece_corners = [trimesh.bounds.corners(mesh.bounds) for mesh in meshes]
             self._mold_axis = np.asarray(result.parting.direction, dtype=float)
             self._mold_frame.visible = self._pieces_visible
+        self.show_surface(result)
         self.set_explode(explode)
 
     def clear_mold(self) -> None:
+        self.remove_surface()
         with self._lock:
             for node in self._pieces:
                 node.remove()

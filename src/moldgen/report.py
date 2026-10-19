@@ -73,6 +73,8 @@ def summary(result: MoldResult) -> dict[str, Any]:
             "offset_mm": round(float(result.parting.offset), 3),
             "undercut_fraction": round(float(result.parting.undercut_fraction), 4),
             "low_draft_fraction": round(float(result.parting.low_draft_fraction), 4),
+            "surface": "flat" if result.surface is None else "curved",
+            "surface_rise_mm": 0.0 if result.surface is None else round(result.surface.rise, 2),
         },
         "mold": {
             "pieces": len(result.pieces),

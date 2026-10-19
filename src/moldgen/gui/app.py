@@ -3,6 +3,8 @@
 Start it with ``moldgen gui`` or :func:`run`. The browser tab shows the part
 coloured by the parting analysis, the parting plane, the mold settings and,
 after generating, an exploded view of the mold pieces with a zip download.
+A curved parting surface, when the mold uses one, replaces the plane until
+the plane or the settings change.
 When the mold has a planned piece layout the part is coloured by piece instead.
 This module holds the controls and jobs; the 3D scene lives in
 :class:`moldgen.gui.viewer.Viewer`.
@@ -244,6 +246,13 @@ class MoldGui:
                 initial_value=d.max_pieces,
                 hint="Most pieces Automatic may use. Areas still locked are filled in the cavity.",
             )
+            self.parting_surface = gui.add_dropdown(
+                "Parting surface",
+                tuple(st.PARTING_SURFACE_OPTIONS),
+                initial_value=st.label_for(st.PARTING_SURFACE_OPTIONS, d.parting_surface),
+                hint="Lets the line between the two halves follow the part where a flat cut "
+                "would trap it.",
+            )
             self.wall_auto = gui.add_checkbox(
                 "Auto wall", d.wall_auto, hint="Derive the wall thickness from the part size."
             )
@@ -357,6 +366,7 @@ class MoldGui:
             self.print_material,
             self.pieces,
             self.max_pieces,
+            self.parting_surface,
             self.wall_auto,
             self.wall,
             self.keys,
@@ -450,6 +460,7 @@ class MoldGui:
             print_material=self._print_options[self.print_material.value],
             pieces=st.PIECE_OPTIONS[self.pieces.value],
             max_pieces=int(self.max_pieces.value),
+            parting_surface=st.PARTING_SURFACE_OPTIONS[self.parting_surface.value],
             wall_auto=self.wall_auto.value,
             wall_thickness=float(self.wall.value),
             keys=int(self.keys.value),
@@ -488,6 +499,7 @@ class MoldGui:
             self.print_material,
             self.pieces,
             self.max_pieces,
+            self.parting_surface,
             self.wall_auto,
             self.keys,
             self.clearance,
@@ -499,6 +511,8 @@ class MoldGui:
         ):
             handle.disabled = generating
         self.max_pieces.visible = self.pieces.value == st.AUTO_PIECES
+        # Four pieces always split along a flat plane.
+        self.parting_surface.visible = st.PIECE_OPTIONS[self.pieces.value] != 4
         self.wall.disabled = generating or self.wall_auto.value
         self.sprue.disabled = generating or self.sprue_auto.value
         self.shrink.disabled = generating or self.shrink_auto.value
@@ -622,8 +636,9 @@ class MoldGui:
             self._result_outdated = True
             parting = self._parting
         self.result_note.visible = True
+        # The piece colours and the curved surface describe the old mold; go back to the analysis.
+        self.viewer.remove_surface()
         if parting is not None:
-            # The piece colours describe the old mold; go back to the analysis colours.
             self.viewer.show_classes(np.asarray(parting.face_class))
 
     def _on_visibility(self, _event: Any) -> None:
@@ -926,7 +941,8 @@ class MoldGui:
         self.viewer.show_mold(result, float(self.explode.value))
         self.viewer.frame_mold()
         layout = result.layout
-        if layout is not None:
+        # Two halves on a curved surface report only the locked share, without face regions.
+        if layout is not None and len(layout.face_region):
             self.viewer.show_piece_regions(
                 st.face_pieces(
                     layout.face_region,

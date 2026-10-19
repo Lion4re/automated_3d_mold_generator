@@ -67,6 +67,10 @@ class MoldConfig:
     max_pieces: int = 6
     """Most pieces "auto" may use; areas still locked are filled in the cavity."""
 
+    parting_surface: str = "auto"
+    """"auto" lets the parting between the halves curve along the part where a flat
+    plane would leave undercuts; "flat" always uses the plane."""
+
     wall_thickness: float | None = None
     """Minimum distance from the part's bounding box to the outside of the mold."""
 
@@ -133,6 +137,8 @@ class MoldConfig:
             raise ConfigError("Scale must be positive")
         if self.pieces not in (2, 4, "auto"):
             raise ConfigError("Pieces must be 2, 4 or auto")
+        if self.parting_surface not in ("auto", "flat"):
+            raise ConfigError("Parting surface must be auto or flat")
         if not MIN_AUTO_PIECES <= self.max_pieces <= MAX_AUTO_PIECES:
             raise ConfigError(f"Max pieces must be between {MIN_AUTO_PIECES} and {MAX_AUTO_PIECES}")
         if self.wall_thickness is not None and not self.wall_thickness > 0:
