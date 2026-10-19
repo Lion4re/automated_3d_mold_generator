@@ -509,9 +509,16 @@ def _generate_mold(
         surface=surface,
         pieces_catch=bool(problems),
     )
-    if curved_caps:
-        # The search with curved cuts is greedy, and the pieces it plans are checked
-        # less exactly; keep whichever of it and flat side pieces gives the better mold.
+    searched_curved = (
+        config.pieces == "auto"
+        and config.side_piece_cuts == "auto"
+        and layout is not None
+        and (bool(layout.caps) or layout.locked_fraction > 0)
+    )
+    if searched_curved:
+        # The search with curved cuts is greedy, the pieces it plans are checked less
+        # exactly, and curved candidates it later rejects can crowd out flat ones even
+        # when it ends with flat pieces; keep whichever gives the better mold.
         flat = _generate_mold(
             part, replace(config, side_piece_cuts="flat"), parting=given_parting, progress=progress
         )
@@ -815,8 +822,8 @@ def _gating_for_pieces(
         key = (round(locked, 3), len(caps), rank)
         if best_key is None or key < best_key:
             best_key, best = key, option
-        if locked <= GOOD_ENOUGH_LOCKED:
-            break
+        if locked <= GOOD_ENOUGH_LOCKED and not caps:
+            break  # another side could only tie
     return best
 
 
