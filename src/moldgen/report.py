@@ -35,17 +35,22 @@ def summary(result: MoldResult) -> dict[str, Any]:
     """JSON-serialisable description of the mold and the decisions behind it."""
     part = result.part.mesh
     block_size = result.block_bounds[1] - result.block_bounds[0]
+    to_part = result.parting.from_mold[:3, :3]
     pieces = []
     for piece in result.pieces:
         volume_cm3 = float(piece.mesh.volume) / 1000.0
+        pull = to_part @ piece.pull
         pieces.append(
             {
                 "name": piece.name,
                 "volume_cm3": round(volume_cm3, 2),
                 "approx_mass_g": round(volume_cm3 * result.print_material.density_g_cm3, 1),
                 "print_size_mm": _round(piece.print_mesh().extents, 1),
+                "pull_direction": _round(pull, 4),
+                "pull_label": _direction_label(pull),
             }
         )
+    layout = result.layout
     return {
         "moldgen_version": __version__,
         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -81,6 +86,14 @@ def summary(result: MoldResult) -> dict[str, Any]:
             "key_clearance_mm": result.config.clearance,
         },
         "pieces": pieces,
+        "layout": None
+        if layout is None
+        else {
+            "side_pieces": len(layout.caps),
+            "locked_fraction": round(layout.locked_fraction, 4),
+            "filled_volume_cm3": round(layout.filled_volume / 1000.0, 3),
+            "remaining_locked_fraction": round(layout.remaining_locked_fraction, 4),
+        },
         "warnings": list(result.warnings),
         "timings_s": {name: round(seconds, 3) for name, seconds in result.timings.items()},
         "config": result.config.to_dict(),
@@ -105,6 +118,7 @@ def instructions(result: MoldResult) -> str:
         "- A layer height of 0.12-0.2 mm gives a smooth cavity; sand or coat it for a glossy cast.",
         "",
         "ASSEMBLY",
+        *_assembly_order(result),
         "- Check that the registration keys seat fully before casting; lightly sand them if tight.",
         "- Clamp or tape the pieces firmly. For thin liquids, seal the outer seam with tape or clay.",
         f"- Apply release agent to the cavity: {material.release_agent}.",
@@ -121,15 +135,28 @@ def instructions(result: MoldResult) -> str:
         )
     if material.pour_temp_c is not None:
         low, high = material.pour_temp_c
-        lines.append(f"- Typical pour temperature: {low:.0f}-{high:.0f} C.")
+        lines.append(f"- Typical pour temperature: {low:.0f}-{high:.0f} °C.")
     if material.notes:
         lines.append(f"- {material.notes}")
-    lines += [
-        "",
-        "DEMOLDING",
-        "- Separate the pieces along the parting line; do not lever against the cavity edges.",
-        "- Trim the sprue and vent stubs from the cast.",
-    ]
+    lines += ["", "DEMOLDING"]
+    if result.layout is not None and result.layout.caps:
+        order = ", ".join(
+            f"{piece['name']} along {piece['pull_label']}" for piece in info["pieces"]
+        )
+        lines += [
+            f"- Remove the pieces in this order, each along the direction given: {order}.",
+            "- Slide each piece straight out; do not twist or lever it.",
+        ]
+    else:
+        lines.append(
+            "- Separate the pieces along the parting line; do not lever against the cavity edges."
+        )
+    lines.append("- Trim the sprue and vent stubs from the cast.")
+    if result.layout is not None and result.layout.filled_volume > 0:
+        lines.append(
+            f"- No piece could release {result.layout.locked_fraction:.1%} of the surface; the "
+            "cavity was filled there, so the cast is solid in those spots."
+        )
     low_draft = result.parting.low_draft_fraction
     if low_draft > 0.05:
         lines.append(
@@ -145,6 +172,13 @@ def instructions(result: MoldResult) -> str:
     if result.warnings:
         lines += ["", "WARNINGS", *(f"- {warning}" for warning in result.warnings)]
     return "\n".join(lines) + "\n"
+
+
+def _assembly_order(result: MoldResult) -> list[str]:
+    if result.layout is None or not result.layout.caps:
+        return []
+    order = ", ".join(piece.name for piece in reversed(result.pieces))
+    return [f"- Assemble in this order: {order} (the reverse of the removal order)."]
 
 
 def save_result(result: MoldResult, out_dir: str | Path) -> list[Path]:

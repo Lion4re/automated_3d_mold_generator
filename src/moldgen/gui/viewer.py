@@ -1,4 +1,4 @@
-"""3D scene of the GUI: the part coloured by face class, the parting plane and the mold.
+"""3D scene of the GUI: the coloured part, the parting plane and the mold.
 
 Everything lives under the ``/scene`` frame, which is shifted so the loaded
 part sits centred on the ground grid. Inside ``/scene`` the coordinates are
@@ -53,8 +53,7 @@ class Viewer:
         self._faces: np.ndarray | None = None
         self._part_bottom = 0.0
         self._offset = np.zeros(3)
-        self._class_nodes: dict[int, Any] = {}
-        self._shown_class: np.ndarray | None = None
+        self._part_nodes: dict[str, tuple[Any, np.ndarray, st.RGB]] = {}
         self._plane: Any = None
         self._plane_direction: np.ndarray | None = None
         self._plane_visible = True
@@ -87,10 +86,9 @@ class Viewer:
         with self._lock:
             self._vertices, self._faces = vertices, faces
             self._part_bottom = float(bounds[0][2])
-            for node in self._class_nodes.values():
+            for node, _, _ in self._part_nodes.values():
                 node.remove()
-            self._class_nodes = {}
-            self._shown_class = None
+            self._part_nodes = {}
             centre = bounds.mean(axis=0)
             self._offset = np.array([-centre[0], -centre[1], -bounds[0][2]])
         self._root.position = self._offset
@@ -104,28 +102,39 @@ class Viewer:
         self.frame(bounds)
 
     def show_classes(self, face_class: np.ndarray | None) -> None:
-        """Colour the part by face class (``None``: all neutral), resending only what changed."""
+        """Colour the part by face class (``None``: all neutral)."""
+        with self._lock:
+            if self._faces is None:
+                return
+            n_faces = len(self._faces)
+        labels = np.zeros(n_faces, dtype=int) if face_class is None else np.asarray(face_class)
+        self._paint({st.FACE_KEYS[c]: (labels == c, color) for c, color in st.FACE_COLORS.items()})
+
+    def show_piece_regions(self, face_piece: np.ndarray) -> None:
+        """Colour the part by the mold piece that releases each face (see :func:`face_pieces`)."""
+        labels = np.asarray(face_piece)
+        groups = {"filled": (labels == st.FILLED, st.FILLED_COLOR)}
+        for i in range(int(labels.max(initial=-1)) + 1):
+            groups[f"piece{i}"] = (labels == i, st.piece_color(i))
+        self._paint(groups)
+
+    def _paint(self, groups: dict[str, tuple[np.ndarray, st.RGB]]) -> None:
+        """Show the part as one mesh per ``name: (face mask, colour)``, resending only changes."""
         with self._lock:
             if self._vertices is None or self._faces is None:
                 return
-            vertices, faces = self._vertices, self._faces
-            new = np.zeros(len(faces), dtype=int) if face_class is None else np.asarray(face_class)
-            old = self._shown_class
-            self._shown_class = new.copy()
-            for cls, color in st.FACE_COLORS.items():
-                mask = new == cls
-                node = self._class_nodes.get(cls)
-                if node is not None and old is not None and np.array_equal(mask, old == cls):
-                    continue
-                if node is not None:
+            for name in list(self._part_nodes):
+                node, mask, color = self._part_nodes[name]
+                new = groups.get(name)
+                if new is None or new[1] != color or not np.array_equal(new[0], mask):
                     node.remove()
-                    del self._class_nodes[cls]
-                if not mask.any():
+                    del self._part_nodes[name]
+            for name, (mask, color) in groups.items():
+                if name in self._part_nodes or not mask.any():
                     continue
-                v, f = st.submesh(vertices, faces, mask)
-                self._class_nodes[cls] = self.server.scene.add_mesh_simple(
-                    f"/scene/part/{st.FACE_KEYS[cls]}", v, f, color=color
-                )
+                v, f = st.submesh(self._vertices, self._faces, mask)
+                node = self.server.scene.add_mesh_simple(f"/scene/part/{name}", v, f, color=color)
+                self._part_nodes[name] = (node, mask.copy(), color)
 
     def projection_range(self, direction: np.ndarray) -> tuple[float, float]:
         """Extent of the part along ``direction``."""
@@ -218,9 +227,18 @@ class Viewer:
     # Mold
 
     def show_mold(self, result: MoldResult, explode: float) -> None:
-        """Show the mold pieces around the part, pulled apart by ``explode`` mm."""
+        """Show the mold pieces around the part, pulled apart by ``explode`` mm.
+
+        Pieces of a planned layout move along their own pull. Quarter pieces
+        share a pull, so without a layout they spread out from the block centre.
+        """
         from_mold = result.parting.from_mold
-        dirs = st.explode_directions([p.mesh.bounds for p in result.pieces], result.block_bounds)
+        if result.layout is not None:
+            dirs = np.array([p.pull for p in result.pieces], dtype=float)
+        else:
+            dirs = st.explode_directions(
+                [p.mesh.bounds for p in result.pieces], result.block_bounds
+            )
         meshes = []
         for piece in result.pieces:
             mesh = piece.mesh.copy()
@@ -235,7 +253,7 @@ class Viewer:
                         f"/scene/mold/piece{i}",
                         vertices,
                         faces,
-                        color=st.PIECE_COLORS[i % len(st.PIECE_COLORS)],
+                        color=st.piece_color(i),
                     )
                 )
             self._piece_dirs = dirs @ from_mold[:3, :3].T

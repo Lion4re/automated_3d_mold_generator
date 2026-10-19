@@ -8,13 +8,15 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import manifold3d
 import numpy as np
+import shapely
 import trimesh
 
 from moldgen import booleans
 from moldgen.config import MoldConfig
-from moldgen.gating import GatingPlan, plan_gating
-from moldgen.keys import KeyPlan, plan_keys
+from moldgen.gating import POUR_DIRECTIONS, GatingPlan, cross_section_to_shapely, plan_gating
+from moldgen.keys import KeyPlan, plan_keys, plan_keys_on_plane, plane_basis
 from moldgen.materials import (
     Material,
     PrintMaterial,
@@ -24,6 +26,20 @@ from moldgen.materials import (
 )
 from moldgen.meshio import load_mesh, units_warning
 from moldgen.parting import PartingResult, analyze_parting
+from moldgen.pieces import (
+    QUICK_DIRECTIONS,
+    UP,
+    CastFaces,
+    PieceLayout,
+    block_solid,
+    cap_region,
+    choose_main_direction,
+    core_half,
+    locked_faces,
+    plan_caps,
+    plan_layout,
+    trim,
+)
 from moldgen.repair import RepairReport, repair_mesh
 
 log = logging.getLogger(__name__)
@@ -40,6 +56,17 @@ KEY_MARGIN_FRACTION_OF_WALL = 0.25
 MIN_KEY_MARGIN_MM = 1.0
 MAX_KEY_MARGIN_MM = 3.0
 SECONDARY_KEYS_PER_SEAM = 2
+SIDE_PIECE_KEYS = 2
+SEAM_SLAB_HALF_MM = 0.05
+"""Half thickness of the slabs that keep keys of one seam off the other seams."""
+SLIVER_VOLUME_FRACTION = 1e-6
+"""Shells of the mold body smaller than this share of its volume are numerical slivers."""
+REMOVAL_STEPS_FRACTION = (0.01, 0.05, 0.2, 1.0)
+"""Distances (times the block size) each piece is slid along its pull to check removal."""
+REMOVAL_OVERLAP_FRACTION = 1e-4
+"""Overlap (times the piece volume) tolerated when sliding, for the release tolerance."""
+SLICE_INSET = 1e-5
+"""How far (times the block size) from a seam its two sides are sliced to find the mating face."""
 
 
 class MoldError(RuntimeError):
@@ -63,6 +90,8 @@ class MoldPiece:
     """The piece in its assembled position (mold frame)."""
     print_transform: np.ndarray
     """Places the piece on the build plate with its parting face up."""
+    pull: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    """Direction the piece is pulled off the cast (mold frame)."""
 
     def print_mesh(self) -> trimesh.Trimesh:
         return self.mesh.copy().apply_transform(self.print_transform)
@@ -85,6 +114,8 @@ class MoldResult:
     pieces: list[MoldPiece]
     warnings: list[str] = field(default_factory=list)
     timings: dict[str, float] = field(default_factory=dict)
+    layout: PieceLayout | None = None
+    """Side pieces and locked-area report when ``config.pieces == "auto"``."""
 
     def save(self, out_dir: str | Path) -> list[Path]:
         from moldgen.report import save_result
@@ -243,7 +274,16 @@ def generate_mold(
             config.parting_offset,
             draft_threshold_deg=config.draft_threshold_deg,
         )
-    if parting.undercut_fraction > UNDERCUT_WARNING_FRACTION:
+    if config.pieces == "auto" and config.direction == "auto" and config.parting_offset is None:
+        main = choose_main_direction(part.mesh, parting, config.max_pieces)
+        if main is not None and not np.allclose(main.direction, parting.direction):
+            parting = analyze_parting(
+                part.mesh,
+                main.direction,
+                main.offset,
+                draft_threshold_deg=config.draft_threshold_deg,
+            )
+    if config.pieces != "auto" and parting.undercut_fraction > UNDERCUT_WARNING_FRACTION:
         warnings.append(
             f"{parting.undercut_fraction:.1%} of the surface is undercut for this parting plane; "
             "the cast may lock in the mold. Try another direction, more pieces or a flexible "
@@ -263,17 +303,29 @@ def generate_mold(
     block = trimesh.creation.box(bounds=block_bounds)
 
     stages.start("Placing the sprue and vents")
-    try:
-        gating = plan_gating(
+
+    def place_gating(up: np.ndarray | None = None) -> GatingPlan:
+        return plan_gating(
             cavity,
             block_bounds,
             sprue_diameter=config.sprue_diameter or material.sprue_diameter_mm,
             vent_diameter=config.vent_diameter or material.vent_diameter_mm,
             funnel=config.funnel,
             vents=config.vents,
+            up=up,
         )
+
+    try:
+        gating = place_gating()
     except ValueError as exc:
         raise MoldError(f"Cannot place the sprue: {str(exc).rstrip('.')}.") from exc
+
+    layout = None
+    if config.pieces == "auto":
+        stages.start("Planning the mold pieces")
+        gating = _gating_for_pieces(cavity, gating, place_gating, config.max_pieces)
+        layout, cavity = plan_layout(cavity, gating.solids(), block_bounds, config.max_pieces)
+        warnings.extend(_layout_warnings(layout))
     if gating.unvented:
         warnings.append(
             f"{gating.unvented} air pockets have no vent and may leave bubbles in the cast"
@@ -287,13 +339,59 @@ def generate_mold(
             "Part of the cavity is not reachable from the sprue (for example a separate body), "
             "so it will not fill when pouring."
         )
-    top, bottom = booleans.split_by_plane(body, np.array([0.0, 0.0, 1.0]), 0.0)
-
     stages.start("Adding registration keys")
     key_radius, key_margin = auto_key_size(wall, config.clearance)
     if config.key_diameter:
         key_radius = config.key_diameter / 2
     obstacles = [cavity, *gating_solids]
+    if layout is not None and layout.caps:
+        pieces, key_plans = _layout_pieces(
+            body, layout, obstacles, block_bounds, config, key_radius, key_margin, warnings
+        )
+    else:
+        pieces, key_plans = _halves(
+            body, gating, obstacles, block_bounds, config, key_radius, key_margin, warnings, stages
+        )
+
+    stages.start("Checking the result")
+    for piece in pieces:
+        if piece.mesh.is_empty or not piece.mesh.is_watertight:
+            raise MoldError(f"Mold piece {piece.name!r} came out broken (not a closed solid).")
+
+    stages.finish()
+    return MoldResult(
+        config=config,
+        material=material,
+        print_material=print_material,
+        part=part,
+        parting=parting,
+        cavity=cavity,
+        shrink_scale=shrink_scale,
+        wall_thickness=wall,
+        block_bounds=block_bounds,
+        gating=gating,
+        keys=key_plans,
+        pieces=pieces,
+        warnings=warnings,
+        timings=stages.timings,
+        layout=layout,
+    )
+
+
+def _halves(
+    body: trimesh.Trimesh,
+    gating: GatingPlan,
+    obstacles: list[trimesh.Trimesh],
+    block_bounds: np.ndarray,
+    config: MoldConfig,
+    key_radius: float,
+    key_margin: float,
+    warnings: list[str],
+    stages: _Stages,
+) -> tuple[list[MoldPiece], list[KeyPlan]]:
+    """Split ``body`` into the classic two halves, or four pieces with ``config.pieces == 4``."""
+    top, bottom = booleans.split_by_plane(body, np.array([0.0, 0.0, 1.0]), 0.0)
+
     secondary_axis = _secondary_axis(gating) if config.pieces == 4 else None
     secondary_offset = (
         float(block_bounds.mean(axis=0)[secondary_axis]) if secondary_axis is not None else 0.0
@@ -323,8 +421,8 @@ def generate_mold(
 
     if secondary_axis is None:
         pieces = [
-            MoldPiece("top", top, _print_transform(top, flip=True)),
-            MoldPiece("bottom", bottom, _print_transform(bottom, flip=False)),
+            MoldPiece("top", top, _print_transform(top, flip=True), pull=UP),
+            MoldPiece("bottom", bottom, _print_transform(bottom, flip=False), pull=-UP),
         ]
     else:
         stages.start("Splitting into four pieces")
@@ -351,43 +449,235 @@ def generate_mold(
                 plus = booleans.difference(plus, seam_keys.female_solids())
                 key_plans.append(seam_keys)
             axis_name = "xy"[secondary_axis]
-            pieces.append(
-                MoldPiece(f"{half_name}_{axis_name}-", minus, _print_transform(minus, flip))
-            )
-            pieces.append(
-                MoldPiece(f"{half_name}_{axis_name}+", plus, _print_transform(plus, flip))
-            )
+            pull = UP if flip else -UP
+            for sign, piece in (("-", minus), ("+", plus)):
+                pieces.append(
+                    MoldPiece(
+                        f"{half_name}_{axis_name}{sign}",
+                        piece,
+                        _print_transform(piece, flip),
+                        pull=pull,
+                    )
+                )
 
-    stages.start("Checking the result")
-    for piece in pieces:
-        if piece.mesh.is_empty or not piece.mesh.is_watertight:
-            raise MoldError(f"Mold piece {piece.name!r} came out broken (not a closed solid).")
+    return pieces, key_plans
 
-    stages.finish()
-    return MoldResult(
-        config=config,
-        material=material,
-        print_material=print_material,
-        part=part,
-        parting=parting,
-        cavity=cavity,
-        shrink_scale=shrink_scale,
-        wall_thickness=wall,
-        block_bounds=block_bounds,
-        gating=gating,
-        keys=key_plans,
-        pieces=pieces,
-        warnings=warnings,
-        timings=stages.timings,
+
+def _layout_pieces(
+    body: trimesh.Trimesh,
+    layout: PieceLayout,
+    obstacles: list[trimesh.Trimesh],
+    block_bounds: np.ndarray,
+    config: MoldConfig,
+    key_radius: float,
+    key_margin: float,
+    warnings: list[str],
+) -> tuple[list[MoldPiece], list[KeyPlan]]:
+    """Cut ``body`` into the side pieces of ``layout`` and the two halves, in removal order.
+
+    Each side piece carries male keys on its cut face pointing back along its
+    pull, and the pieces behind it get the sockets, so it slides off its keys
+    and leaves nothing sticking out of the pieces that are still in place.
+    The pieces stay manifold3d solids until the end: converting to a mesh and
+    back can fuse sheets that touch along an edge.
+    """
+    caps = layout.caps
+    rest = booleans.to_manifold(body, "the mold body")
+    remaining = block_solid(block_bounds)
+    inset = SLICE_INSET * float(np.linalg.norm(block_bounds[1] - block_bounds[0]))
+    solids: list[tuple[str, manifold3d.Manifold, np.ndarray]] = []
+    key_plans: list[KeyPlan] = []
+    for k, cap in enumerate(caps):
+        piece = cap_region(cap, rest)
+        rest = rest - piece
+        if config.keys > 0:
+            rows = plane_basis(-cap.direction)
+            behind = trim(remaining, [(-cap.direction, -cap.offset), *cap.halfspaces()[1:]])
+            face = _section(cap_region(cap, remaining), rows, -cap.offset - inset).intersection(
+                _section(behind, rows, -cap.offset + inset)
+            )
+            if face.area == 0:
+                # The cut plane lies in space earlier pieces took: nothing behind to key to.
+                remaining = remaining - cap_region(cap, remaining)
+                solids.append((f"side_{k + 1}", piece, cap.direction))
+                continue
+            # Only the side piece has bumps; the pieces behind just get sockets, so a
+            # socket may cross a later seam and needs no clearance from it.
+            plan = plan_keys_on_plane(
+                obstacles,
+                -cap.direction,
+                -cap.offset,
+                face,
+                count=SIDE_PIECE_KEYS,
+                radius=key_radius,
+                clearance=config.clearance,
+                margin=key_margin,
+            )
+            if not cap.bounds:
+                # A boxed-in side piece sits in a pocket of the halves, which locates it.
+                _check_key_count(plan, SIDE_PIECE_KEYS, f"side piece {k + 1}", warnings)
+            if len(plan.positions):
+                piece = piece + _joined(plan.male_solids())
+                rest = rest - _joined(plan.female_solids())
+                key_plans.append(plan)
+        remaining = remaining - cap_region(cap, remaining)
+        solids.append((f"side_{k + 1}", piece, cap.direction))
+
+    top = rest.trim_by_plane((0.0, 0.0, 1.0), 0.0)
+    bottom = rest.trim_by_plane((0.0, 0.0, -1.0), 0.0)
+    if not layout.top_needed:
+        # No cast face touches the leftover top block, and the bottom comes off
+        # last, so the two can be one piece.
+        top, bottom = manifold3d.Manifold(), bottom + top
+    elif config.keys > 0 and not (top.is_empty() or bottom.is_empty()):
+        rows = plane_basis(UP)
+        face = _section(core_half(block_bounds, caps, 1), rows, inset).intersection(
+            _section(core_half(block_bounds, caps, -1), rows, -inset)
+        )
+        # The bumps stand up into the top half; keep them clear of the side pieces,
+        # which slide in over them during assembly.
+        seams = [_slab(block_bounds, n, c) for cap in caps for n, c in cap.planes()]
+        plan = plan_keys_on_plane(
+            obstacles + seams,
+            UP,
+            0.0,
+            face,
+            count=config.keys,
+            radius=key_radius,
+            clearance=config.clearance,
+            margin=key_margin,
+        )
+        # Side pieces leave less of the parting face; two keys are enough to align the halves.
+        _check_key_count(plan, min(config.keys, 2), "the parting face", warnings)
+        if len(plan.positions):
+            bottom = bottom + _joined(plan.male_solids())
+            top = top - _joined(plan.female_solids())
+            key_plans.append(plan)
+    solids += [("top", top, UP), ("bottom", bottom, -UP)]
+    block_volume = float(np.prod(block_bounds[1] - block_bounds[0]))
+    solids = [item for item in solids if item[1].volume() > SLIVER_VOLUME_FRACTION * block_volume]
+    warnings.extend(_removal_warnings(solids, obstacles, block_bounds))
+
+    pieces = []
+    for name, solid, pull in solids:
+        mesh = booleans.to_trimesh(solid)
+        pieces.append(MoldPiece(name, mesh, _print_transform_along(mesh, pull), pull=pull))
+    return pieces, key_plans
+
+
+def _removal_warnings(
+    solids: list[tuple[str, manifold3d.Manifold, np.ndarray]],
+    cast: list[trimesh.Trimesh],
+    block_bounds: np.ndarray,
+) -> list[str]:
+    """Slide each piece out in removal order and report any that catch on something.
+
+    A safety net for the planner: the cast and the pieces still in place
+    must not overlap a piece at any point along its pull.
+    """
+    cast_solid = _joined(cast)
+    size = float(np.linalg.norm(block_bounds[1] - block_bounds[0]))
+    warnings = []
+    for i, (name, solid, pull) in enumerate(solids):
+        others = manifold3d.Manifold.batch_boolean(
+            [cast_solid, *(s for _, s, _ in solids[i + 1 :])], manifold3d.OpType.Add
+        )
+        allowed = REMOVAL_OVERLAP_FRACTION * solid.volume()
+        for distance in REMOVAL_STEPS_FRACTION:
+            moved = solid.translate(tuple(np.asarray(pull) * distance * size))
+            if (moved ^ others).volume() > allowed:
+                warnings.append(
+                    f"The {name.replace('_', ' ')} piece may catch on the cast or on another "
+                    "piece when it is removed; check it before printing."
+                )
+                break
+    return warnings
+
+
+def _joined(meshes: list[trimesh.Trimesh]) -> manifold3d.Manifold:
+    return manifold3d.Manifold.batch_boolean(
+        [booleans.to_manifold(mesh, "a key") for mesh in meshes], manifold3d.OpType.Add
     )
+
+
+def _gating_for_pieces(
+    cavity: trimesh.Trimesh,
+    gating: GatingPlan,
+    place_gating: Callable[[np.ndarray], GatingPlan],
+    max_pieces: int,
+) -> GatingPlan:
+    """Pick the pour side whose sprue and vents leave the side pieces the least locked area.
+
+    The sprue lies in the parting plane, so a side piece that crosses it must
+    also slide off the sprue stub. The default pour side is kept unless
+    another one lets the pieces release more of the part.
+    """
+    best_key, best = None, gating
+    options: list[GatingPlan | np.ndarray] = [gating]
+    options += [up for up in POUR_DIRECTIONS if not np.allclose(up, gating.up)]
+    for rank, option in enumerate(options):
+        if not isinstance(option, GatingPlan):
+            try:
+                option = place_gating(option)
+            except ValueError:
+                continue
+        cast = CastFaces(cavity, option.solids())
+        caps = plan_caps(cast, max_pieces - 2, directions=QUICK_DIRECTIONS)
+        locked = cast.locked_area(locked_faces(cast, caps))
+        key = (round(locked, 3), len(caps), rank)
+        if best_key is None or key < best_key:
+            best_key, best = key, option
+        if locked == 0.0:
+            break
+    return best
+
+
+def _layout_warnings(layout: PieceLayout) -> list[str]:
+    warnings = []
+    if layout.filled_volume > 0:
+        warnings.append(
+            f"{layout.locked_fraction:.1%} of the surface cannot be released by any piece; the "
+            f"cavity was filled there, adding {layout.filled_volume / 1000.0:.2f} cm³ to the cast."
+        )
+    return warnings
+
+
+def _section(solid: manifold3d.Manifold, rows: np.ndarray, height: float) -> shapely.Geometry:
+    """Cross-section of ``solid`` at ``dot(p, rows[2]) == height``, in ``rows`` coordinates."""
+    local = solid.transform(np.column_stack([rows, np.zeros(3)]))
+    return cross_section_to_shapely(local.slice(height))
+
+
+def _slab(block_bounds: np.ndarray, normal: np.ndarray, offset: float) -> trimesh.Trimesh:
+    """A thin slab of the block around the plane ``dot(p, normal) == offset``."""
+    normal = np.asarray(normal, dtype=float)
+    slab = (
+        block_solid(block_bounds)
+        .trim_by_plane(tuple(normal), offset - SEAM_SLAB_HALF_MM)
+        .trim_by_plane(tuple(-normal), -(offset + SEAM_SLAB_HALF_MM))
+    )
+    return booleans.to_trimesh(slab)
+
+
+def _print_transform_along(mesh: trimesh.Trimesh, pull: np.ndarray) -> np.ndarray:
+    """Turn the side facing against ``pull`` up, then rest the piece on z == 0."""
+    transform = trimesh.geometry.align_vectors(-np.asarray(pull, dtype=float), [0.0, 0.0, 1.0])
+    vertices = trimesh.transform_points(mesh.vertices, transform)
+    lo, hi = vertices.min(axis=0), vertices.max(axis=0)
+    shift = np.array([-(lo[0] + hi[0]) / 2, -(lo[1] + hi[1]) / 2, -lo[2]])
+    return trimesh.transformations.translation_matrix(shift) @ transform
 
 
 def _enclosed_voids(body: trimesh.Trimesh) -> bool:
-    """True if the mold body has internal surfaces, i.e. a void not open to the outside."""
-    components = trimesh.graph.connected_components(
-        body.face_adjacency, nodes=np.arange(len(body.faces)), min_len=1
-    )
-    return len(components) > 1
+    """True if the mold body has internal surfaces, i.e. a void not open to the outside.
+
+    Shells without volume (slivers where a channel just touches a block face)
+    do not count.
+    """
+    shells = body.split(only_watertight=False)
+    with np.errstate(divide="ignore", invalid="ignore"):  # trimesh divides by a zero volume
+        volumes = [abs(shell.volume) for shell in shells]
+    return sum(volume > SLIVER_VOLUME_FRACTION * body.volume for volume in volumes) > 1
 
 
 def _secondary_axis(gating: GatingPlan) -> int:

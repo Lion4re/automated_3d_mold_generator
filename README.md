@@ -3,8 +3,9 @@
 Turn a 3D model into a casting mold you can 3D print.
 
 moldgen takes a mesh (STL, OBJ, PLY, OFF, 3MF, glTF/GLB), finds the direction in
-which a rigid two-piece mold releases the part best, places the parting plane,
-and builds print-ready mold pieces with a pour sprue and funnel, air vents and
+which a rigid mold releases the part best, places the parting plane, adds side
+pieces where the two halves alone would lock on the part, and builds
+print-ready mold pieces with a pour sprue and funnel, air vents and
 registration keys. Defaults (sprue and vent size, shrinkage compensation,
 release agent, print-material temperature limits) come from presets for common
 casting materials such as polyurethane resin, epoxy, plaster, wax, soap,
@@ -66,7 +67,8 @@ Common options for `make`:
 | `-p, --print-material KEY` | Material the mold is printed in | `pla` |
 | `-d, --direction AXIS` | Demolding direction: `auto`, `x`, `-z`, ... or a vector such as `0,1,1` | `auto` |
 | `--parting-offset MM` | Parting plane position along the direction | least undercut |
-| `--pieces 2\|4` | Split each half once more for 4 pieces | `2` |
+| `--pieces auto\|2\|4` | `auto` adds side pieces where needed; `2` and `4` force a fixed split | `auto` |
+| `--max-pieces N` | Most pieces `auto` may use (2-10) | `6` |
 | `--wall MM` | Wall thickness around the part | from part size |
 | `--sprue MM`, `--vent MM` | Channel diameters | from material |
 | `--keys N`, `--clearance MM` | Registration keys and their fit clearance | `4`, `0.2` |
@@ -122,18 +124,25 @@ result.save("molds/Rook")
 4. **Gating.** The mold is poured with the parting plane vertical. The sprue
    enters at the widest, highest section of the part and ends in a pour funnel.
    Vents are placed at local high points where air would be trapped.
-5. **Keys.** Conical registration keys with a clearance fit are placed on the
-   parting face, clear of the cavity and the channels. Four-piece molds get keys
-   on the second seam too.
-6. **Pieces.** All booleans run on [manifold3d](https://github.com/elalish/manifold),
+5. **Side pieces.** Where the two halves cannot release part of the surface
+   (a side hole, the inside of a handle), side pieces are added. Each comes off
+   in its own straight direction before the halves. Every piece must release
+   every part of the cast it can touch on its way out, and after building, each
+   piece is slid out as an exact solid to confirm it does not catch. Areas that
+   no piece can release are filled and reported. See
+   [docs/multi-piece-design.md](docs/multi-piece-design.md).
+6. **Keys.** Conical registration keys with a clearance fit are placed on the
+   parting face and on the cut faces of side pieces, clear of the cavity and the
+   channels.
+7. **Pieces.** All booleans run on [manifold3d](https://github.com/elalish/manifold),
    so every piece is a closed solid. Each piece is laid flat for printing.
 
 ## Limitations
 
-- The parting surface is a plane. Parts with undercuts in every direction
-  (for example a figure with arms wrapped around its body) cannot be released
-  by a rigid two- or four-piece mold; moldgen reports the undercut share so you
-  can decide to use a flexible silicone mold instead.
+- Cuts are flat. Shapes that lock in every direction, such as a chain link or
+  an arm wrapped around a body, cannot be released by any rigid mold. moldgen
+  fills those spots and reports how much, so you can decide whether to use a
+  flexible silicone mold instead.
 - Draft is analysed and reported, not added to the part.
 - Sealed internal voids cannot be reproduced; the cast is solid there.
 
