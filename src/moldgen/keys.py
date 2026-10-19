@@ -64,6 +64,9 @@ class KeyPlan:
     """(N, 3) key centres lying on the mating face."""
     radius: float
     clearance: float
+    base_depth: float = BOOLEAN_OVERLAP
+    """How far (mm) key and socket reach behind the face. Past ``BOOLEAN_OVERLAP`` they
+    continue as a straight post, which anchors keys standing on a sloped face."""
 
     @property
     def height(self) -> float:
@@ -84,8 +87,7 @@ class KeyPlan:
         """Bumps to add to the ``-normal`` piece."""
         top = self.height
         profile = [
-            (0.0, -BOOLEAN_OVERLAP),
-            (self._key_radius(-BOOLEAN_OVERLAP), -BOOLEAN_OVERLAP),
+            *self._post(self._key_radius(-BOOLEAN_OVERLAP)),
             (self._key_radius(top), top),
             (0.0, top),
         ]
@@ -98,8 +100,7 @@ class KeyPlan:
         self._check_size()
         top = self.socket_depth
         profile = [
-            (0.0, -BOOLEAN_OVERLAP),
-            (self._socket_radius(-BOOLEAN_OVERLAP), -BOOLEAN_OVERLAP),
+            *self._post(self._socket_radius(-BOOLEAN_OVERLAP)),
             (self._socket_radius(top), top),
             (0.0, top),
         ]
@@ -112,6 +113,14 @@ class KeyPlan:
             raise ValueError(
                 f"Key radius {self.radius} mm is too small for a {self.clearance} mm clearance"
             )
+
+    def _post(self, radius: float) -> list[tuple[float, float]]:
+        """Profile points from the axis at the base out to where the tapered wall starts."""
+        depth = max(self.base_depth, BOOLEAN_OVERLAP)
+        points = [(0.0, -depth), (radius, -depth)]
+        if depth > BOOLEAN_OVERLAP:
+            points.append((radius, -BOOLEAN_OVERLAP))
+        return points
 
     def _key_radius(self, height: float) -> float:
         return self.radius - height * _COT

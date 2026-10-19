@@ -212,3 +212,25 @@ def test_rejects_face_not_flat_along_normal(sphere: trimesh.Trimesh) -> None:
     face[1, 2] = 1.0
     with pytest.raises(ValueError, match="flat"):
         _keys([sphere], face)
+
+
+def test_key_on_a_slope_stands_clear_on_a_post() -> None:
+    from moldgen.pipeline import _stand_on
+    from moldgen.surface import PartingSurface
+
+    # A plane rising 0.3 mm per mm along x.
+    xs = np.arange(0.0, 41.0)
+    slope = PartingSurface(np.zeros(2), 1.0, 0.3 * np.repeat(xs[:, None], 41, axis=1))
+    plan = KeyPlan(
+        normal=UP, positions=np.array([[20.0, 20.0, 0.0]]), radius=RADIUS, clearance=CLEARANCE
+    )
+
+    _stand_on(plan, slope, np.eye(3), 1.0)
+
+    reach = plan.footprint_radius
+    assert plan.positions[0, 2] == pytest.approx(0.3 * (20.0 + reach), abs=0.05)
+    assert plan.base_depth == pytest.approx(BOOLEAN_OVERLAP + 0.6 * reach, abs=0.05)
+    male = trimesh.util.concatenate(plan.male_solids())
+    assert male.is_watertight
+    assert male.bounds[0, 2] == pytest.approx(plan.positions[0, 2] - plan.base_depth)
+    assert trimesh.util.concatenate(plan.female_solids()).is_watertight

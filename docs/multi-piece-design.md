@@ -171,8 +171,16 @@ share before filling, the volume added and the share still flagged after it.
 
 ## Printing and output
 
-- **Printing:** each piece is rotated so that the opposite of its pull points
-  up, then rested on the bed. Its cut face is up and the cavity opens upwards.
+- **Printing:** each piece is turned so that the opposite of its pull points
+  up (cut face up, cavity open upwards) unless lying on one of its large flat
+  faces needs less support (`printcheck.best_print_up`), then rested on the
+  bed.
+- **Print checks:** every piece is checked as it lies on the bed
+  (`printcheck.check_piece`): whether it fits the bed (`--bed`), how much flat
+  area it rests on, how much overhangs more than 45 degrees, how much is
+  thinner than the printer makes solid (1.2 mm FDM, 0.8 mm resin, from rays
+  cast inwards) and whether it is small enough to be fragile. Problems become
+  warnings; the figures are in `report.json` and the GUI's piece table.
 - **Pieces:** `MoldPiece.pull` gives the pull direction. `MoldResult.pieces` is
   in removal order.
 - **Layout:** `MoldResult.layout` gives the caps, the piece releasing each part

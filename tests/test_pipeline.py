@@ -8,7 +8,8 @@ import pytest
 import trimesh
 
 from moldgen import MoldConfig, MoldError, booleans, generate_mold
-from moldgen.report import summary, zip_result
+from moldgen.config import ConfigError
+from moldgen.report import instructions, summary, zip_result
 
 
 def _intersection_volume(a: trimesh.Trimesh, b: trimesh.Trimesh) -> float:
@@ -114,6 +115,25 @@ def test_report_and_zip(cylinder, tmp_path):
     json.dumps(summary(result))
     with zipfile.ZipFile(BytesIO(zip_result(result))) as archive:
         assert len(archive.namelist()) == 4
+
+
+def test_instructions_describe_only_what_was_made(cylinder):
+    text = instructions(generate_mold(cylinder, MoldConfig()))
+    assert "funnel faces up" in text and "vent" not in text  # a cylinder traps no air
+    assert "already oriented" in text
+
+    bare = MoldConfig(funnel=False, vents=False, orient_for_print=False)
+    text = instructions(generate_mold(cylinder, bare))
+    assert "funnel" not in text and "vent" not in text
+    assert "sprue opening faces up" in text
+    assert "already oriented" not in text and "assembled position" in text
+
+
+def test_key_too_small_for_its_clearance_is_rejected():
+    with pytest.raises(ConfigError, match="too small"):
+        MoldConfig(key_diameter=0.5, clearance=0.2).validate()
+    MoldConfig(key_diameter=0.5, clearance=0.2, keys=0).validate()
+    MoldConfig(key_diameter=6, clearance=0.2).validate()
 
 
 @pytest.mark.slow

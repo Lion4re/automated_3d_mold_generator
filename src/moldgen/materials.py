@@ -43,6 +43,8 @@ class PrintMaterial:
     alkali_resistant: bool | None = None
     """None when no reliable data was found."""
     inhibits_platinum_silicone: bool = False
+    resin_printed: bool = False
+    """Printed on a resin (SLA/MSLA) printer rather than by fused filament (FDM)."""
     notes: str = ""
     sources: tuple[str, ...] = ()
 
@@ -295,6 +297,7 @@ PRINT_MATERIALS: dict[str, PrintMaterial] = {
         ),
         PrintMaterial(
             key="sla-standard",
+            resin_printed=True,
             name="Standard SLA resin",
             max_service_temp_c=60.0,
             density_g_cm3=1.18,
@@ -302,6 +305,7 @@ PRINT_MATERIALS: dict[str, PrintMaterial] = {
         ),
         PrintMaterial(
             key="sla-tough",
+            resin_printed=True,
             name="Tough SLA resin",
             max_service_temp_c=60.0,
             density_g_cm3=1.18,
@@ -310,6 +314,7 @@ PRINT_MATERIALS: dict[str, PrintMaterial] = {
         ),
         PrintMaterial(
             key="sla-hightemp",
+            resin_printed=True,
             name="High-temperature SLA resin (thermally post-cured)",
             max_service_temp_c=225.0,
             density_g_cm3=1.20,

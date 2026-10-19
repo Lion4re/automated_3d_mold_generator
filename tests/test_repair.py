@@ -221,7 +221,7 @@ def test_flat_sheet_is_reported_as_not_a_solid(monkeypatch):
     assert any("encloses no volume" in warning for warning in report.warnings)
 
 
-def test_unrepairable_mesh_is_reported(monkeypatch):
+def test_fin_on_an_edge_is_cut_off(monkeypatch):
     monkeypatch.setitem(sys.modules, "pymeshfix", None)
     box = trimesh.creation.box([10, 10, 10])
     a, b = box.edges_unique[0]
@@ -234,9 +234,9 @@ def test_unrepairable_mesh_is_reported(monkeypatch):
 
     _, report = repair_mesh(finned)
 
-    assert not report.manifold_ok
-    assert any("not a closed solid" in warning for warning in report.warnings)
-    assert any("moldgen[repair]" in warning for warning in report.warnings)
+    assert report.manifold_ok and report.bodies == 1
+    assert report.volume == pytest.approx(1000.0)
+    assert any(action.startswith("separated") for action in report.actions)
 
 
 def test_empty_mesh_is_reported():

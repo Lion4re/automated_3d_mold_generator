@@ -115,3 +115,26 @@ def test_piece_settings_are_validated(pieces, max_pieces, valid):
     else:
         with pytest.raises(ConfigError):
             config.validate()
+
+
+def test_part_side_pieces_cannot_release_gets_a_two_piece_mold(monkeypatch):
+    from moldgen import pieces, pipeline
+
+    # Through-holes along X and along Y: no single pull releases both.
+    block = trimesh.creation.box([30.0, 30.0, 20.0])
+    holes = [
+        trimesh.creation.cylinder(radius=4.0, height=40.0, transform=turn)
+        for turn in (
+            trimesh.transformations.rotation_matrix(np.pi / 2, [0, 1, 0]),
+            trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0]),
+        )
+    ]
+    drilled = booleans.difference(block, holes)
+    monkeypatch.setattr(pieces, "RIGID_LIMIT_LOCKED", 0.0)
+    monkeypatch.setattr(pipeline, "RIGID_LIMIT_LOCKED", 0.0)
+
+    result = generate_mold(drilled, MoldConfig())
+
+    assert len(result.pieces) == 2 and result.layout is None
+    assert "a rigid mold cannot release this part" in result.warnings[0]
+    assert not any("--pieces auto" in warning for warning in result.warnings)

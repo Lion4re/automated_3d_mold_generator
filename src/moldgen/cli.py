@@ -11,6 +11,7 @@ from __future__ import annotations
 import glob
 import logging
 import math
+import re
 import shlex
 import sys
 import time
@@ -312,6 +313,21 @@ def _parse_direction(text: str) -> str | tuple[float, float, float]:
     return (values[0], values[1], values[2])
 
 
+def _parse_bed(text: str) -> tuple[float, float, float]:
+    """Turn '220x220x250' (or '220,220,250') into a build volume in mm."""
+    try:
+        values = tuple(float(part) for part in re.split(r"[x, ]+", text.strip().lower()))
+    except ValueError:
+        values = ()
+    if len(values) != 3:
+        raise typer.BadParameter(
+            f"{text!r} is not a build volume; give width, depth and height in mm, "
+            "such as 220x220x250",
+            param_hint="'--bed'",
+        )
+    return (values[0], values[1], values[2])
+
+
 def _direction_text(vector: Sequence[float] | np.ndarray) -> str:
     """'+Z' / '-X' for axis directions, otherwise 'x,y,z'; accepted back by --direction."""
     v = np.asarray(vector, dtype=float)
@@ -325,6 +341,7 @@ def _build_config(
     *,
     material: Enum | str = _DEFAULTS.material,
     print_material: Enum | str = _DEFAULTS.print_material,
+    bed: str | None = None,
     units: Units = _DEFAULTS.units,
     scale: float = _DEFAULTS.scale,
     direction: str = "auto",
@@ -368,6 +385,7 @@ def _build_config(
         clearance=clearance,
         repair=repair,
         orient_for_print=orient,
+        bed_size_mm=_DEFAULTS.bed_size_mm if bed is None else _parse_bed(bed),
     )
     try:
         config.validate()
@@ -908,6 +926,14 @@ def make(
     ],
     material: MaterialOption = _DEFAULT_MATERIAL,
     print_material: PrintMaterialOption = _DEFAULT_PRINT_MATERIAL,
+    bed: Annotated[
+        str,
+        _option(
+            "--bed",
+            help="Printer build volume in mm as WIDTHxDEPTHxHEIGHT; pieces are checked against it.",
+            panel=_MATERIAL,
+        ),
+    ] = "x".join(f"{v:g}" for v in _DEFAULTS.bed_size_mm),
     shrinkage: Annotated[
         float | None,
         _option(
@@ -1027,6 +1053,7 @@ def make(
         config = _build_config(
             material=material,
             print_material=print_material,
+            bed=bed,
             units=units,
             scale=scale,
             direction=direction,

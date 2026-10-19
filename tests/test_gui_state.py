@@ -127,6 +127,8 @@ def test_legend_lists_each_piece_with_its_pull_and_colour_then_the_filling():
     assert len(set(st.PIECE_COLORS)) == 10
     assert st.FILLED_COLOR not in st.PIECE_COLORS
     assert len(st.legend_rows({"pieces": pieces, "layout": None})) == 2
+    unfilled = {"locked_fraction": 0.021, "filled_volume_cm3": 0.0}
+    assert st.legend_rows({"pieces": pieces, "layout": unfilled})[-1][0] == "locked"
 
 
 def test_text_is_escaped_and_incompatible_materials_are_flagged():

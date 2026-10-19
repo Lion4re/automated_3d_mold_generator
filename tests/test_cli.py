@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import trimesh
+import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
@@ -495,3 +496,10 @@ def test_end_to_end_open_surface_is_a_one_line_error(tmp_path, monkeypatch, comm
     assert "sheet" in errors[0]
     assert "Traceback" not in result.output
     assert not Path("molds").exists()
+
+
+def test_bed_size_is_parsed_and_checked():
+    assert cli._build_config(bed="300x200x180").bed_size_mm == (300.0, 200.0, 180.0)
+    for text in ("300x200", "300x0x180", "big"):
+        with pytest.raises(typer.BadParameter):
+            cli._build_config(bed=text)

@@ -102,6 +102,9 @@ class MoldConfig:
     orient_for_print: bool = True
     """Rotate each exported piece so its parting face points up (no supports needed)."""
 
+    bed_size_mm: tuple[float, float, float] = (220.0, 220.0, 250.0)
+    """Printer build volume (width, depth, height) the pieces are checked against."""
+
     extra: dict[str, object] = field(default_factory=dict)
     """Free-form values for experimental options; ignored by the core pipeline."""
 
@@ -143,6 +146,8 @@ class MoldConfig:
             raise ConfigError("Pieces must be 2, 4 or auto")
         if self.side_piece_cuts not in ("auto", "flat"):
             raise ConfigError("Side piece cuts must be auto or flat")
+        if len(self.bed_size_mm) != 3 or not all(v > 0 for v in self.bed_size_mm):
+            raise ConfigError("Bed size must be three positive numbers (width, depth, height)")
         if self.parting_surface not in ("auto", "flat"):
             raise ConfigError("Parting surface must be auto or flat")
         if not MIN_AUTO_PIECES <= self.max_pieces <= MAX_AUTO_PIECES:
@@ -161,6 +166,17 @@ class MoldConfig:
             raise ConfigError("Keys must be between 0 and 8")
         if not 0 <= self.clearance <= 2:
             raise ConfigError("Clearance must be between 0 and 2 mm")
+        if self.key_diameter is not None and self.keys > 0:
+            from moldgen.keys import KeyPlan
+
+            plan = KeyPlan(np.zeros(3), np.empty((0, 3)), self.key_diameter / 2, self.clearance)
+            try:
+                plan._check_size()
+            except ValueError:
+                raise ConfigError(
+                    f"A {self.key_diameter:g} mm key is too small for a {self.clearance:g} mm "
+                    "clearance; use a larger key diameter or a smaller clearance"
+                ) from None
         if not 0 <= self.draft_threshold_deg < 45:
             raise ConfigError("Draft threshold must be between 0 and 45 degrees")
         self.direction_vector()
